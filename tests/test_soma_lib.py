@@ -1,0 +1,152 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import soma_lib  # noqa: E402
+
+
+def test_parse_meminfo():
+    text = (
+        "MemTotal:       64000000 kB\n"
+        "MemFree:         1000000 kB\n"
+        "MemAvailable:   36000000 kB\n"
+        "SwapTotal:       2000000 kB\n"
+        "SwapFree:        1000000 kB\n"
+    )
+    m = soma_lib.parse_meminfo(text)
+    assert m["MemTotal"] == 64000000
+    assert m["MemAvailable"] == 36000000
+    assert m["SwapTotal"] == 2000000
+    assert m["SwapFree"] == 1000000
+
+
+def test_parse_loadavg():
+    assert soma_lib.parse_loadavg("1.20 2.30 3.40 1/234 5678") == (1.2, 2.3, 3.4)
+    assert soma_lib.parse_loadavg("garbage") == (0.0, 0.0, 0.0)
+
+
+def test_human_kb():
+    assert soma_lib.human_kb(512) == "0.5M"
+    assert soma_lib.human_kb(50000) == "49M"
+    assert soma_lib.human_kb(6500000) == "6.2G"
+    assert soma_lib.human_kb(16252928) == "15.5G"
+    assert soma_lib.human_kb(110 * 1024 * 1024) == "110G"  # decimals dropped above 100G
+
+
+def test_top_rss(tmp_path):
+    for pid, pages, name in [("100", 50, "small"), ("200", 500, "big"), ("300", 10, "tiny")]:
+        d = tmp_path / pid
+        d.mkdir()
+        (d / "statm").write_text(f"1000 {pages} 100 1 0 200 0\n")
+        (d / "comm").write_text(name + "\n")
+    (tmp_path / "notapid").mkdir()  # non-numeric, ignored
+    top = soma_lib.top_rss(str(tmp_path))
+    assert top["name"] == "big"
+    assert top["rss_kb"] == int(500 * soma_lib.PAGE_KB)
+
+
+def test_top_rss_empty(tmp_path):
+    assert soma_lib.top_rss(str(tmp_path)) is None
+
+
+def test_assess_low_mem():
+    state = {
+        "cores": 16,
+        "mem": {"MemTotal": 1000, "MemAvailable": 50, "SwapTotal": 0, "SwapFree": 0},
+        "load": (0.5, 0, 0), "top": None, "disks": [], "services": [],
+    }
+    a = soma_lib.assess(state)
+    assert "LOW_MEM" in a["flags"]
+
+
+def test_assess_healthy_is_silent():
+    state = {
+        "cores": 16,
+        "mem": {"MemTotal": 64000000, "MemAvailable": 36000000, "SwapTotal": 2000000, "SwapFree": 2000000},
+        "load": (1.2, 0, 0),
+        "top": {"name": "x", "rss_kb": 1000000},
+        "disks": [{"mount": "/", "pct": 50.0, "free_kb": 1}],
+        "services": [],
+    }
+    assert soma_lib.assess(state)["flags"] == set()
+
+
+def test_assess_top_dominant():
+    # 16252928 kB / 64000000 kB = 25.4% > 25% default
+    state = {
+        "cores": 16,
+        "mem": {"MemTotal": 64000000, "MemAvailable": 36000000, "SwapTotal": 0, "SwapFree": 0},
+        "load": (1.0,), "top": {"name": "mnemos-mcp", "rss_kb": 16252928},
+        "disks": [], "services": [],
+    }
+    assert "TOP" in soma_lib.assess(state)["flags"]
+
+
+def test_assess_swap_load_disk_svc():
+    state = {
+        "cores": 4,
+        "mem": {"MemTotal": 1000000, "MemAvailable": 500000, "SwapTotal": 1000000, "SwapFree": 0},
+        "load": (8.0, 0, 0), "top": None,
+        "disks": [{"mount": "/", "pct": 90.0, "free_kb": 1}],
+        "services": [("mariadb", "failed")],
+    }
+    flags = soma_lib.assess(state)["flags"]
+    assert {"SWAP", "LOAD", "DISK", "SVC"} <= flags
+
+
+def test_assess_unknown_service_not_flagged():
+    state = {
+        "cores": 16, "mem": {"MemTotal": 100, "MemAvailable": 90},
+        "load": (0.1,), "top": None, "disks": [], "services": [("x", "unknown")],
+    }
+    assert "SVC" not in soma_lib.assess(state)["flags"]
+
+
+def test_render_carries_flags():
+    state = {
+        "cores": 16,
+        "mem": {"MemTotal": 64000000, "MemAvailable": 3000000, "SwapTotal": 1000000, "SwapFree": 0},
+        "load": (20.0, 0, 0),
+        "top": {"name": "mnemos-mcp", "rss_kb": 16252928},
+        "disks": [{"mount": "/", "pct": 90.0, "free_kb": 1}],
+        "services": [],
+    }
+    a = soma_lib.assess(state)
+    line = soma_lib.render(state, a)
+    assert line.startswith("[system-state]")
+    assert "(LOW)" in line and "(TOP)" in line and "(HIGH)" in line
+    assert "mnemos-mcp" in line
+
+
+def _fake_proc(tmp_path, avail=36000000, total=64000000, swap_total=0, swap_free=0, load="1.0"):
+    (tmp_path / "meminfo").write_text(
+        f"MemTotal: {total} kB\nMemAvailable: {avail} kB\n"
+        f"SwapTotal: {swap_total} kB\nSwapFree: {swap_free} kB\n"
+    )
+    (tmp_path / "loadavg").write_text(f"{load} 1.0 1.0 1/1 1\n")
+    d = tmp_path / "1"
+    d.mkdir()
+    (d / "statm").write_text("100 10 1 1 0 1 0\n")
+    (d / "comm").write_text("init\n")
+    return tmp_path
+
+
+def test_line_for_mode_off():
+    assert soma_lib.line_for_mode("off") is None
+
+
+def test_line_for_mode_pressure_silent_on_healthy(tmp_path):
+    proc = _fake_proc(tmp_path)
+    assert soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[]) is None
+
+
+def test_line_for_mode_always_emits_on_healthy(tmp_path):
+    proc = _fake_proc(tmp_path)
+    line = soma_lib.line_for_mode("always", proc_root=str(proc), mounts=[], services=[])
+    assert line and line.startswith("[system-state]")
+
+
+def test_line_for_mode_pressure_emits_on_swap(tmp_path):
+    proc = _fake_proc(tmp_path, swap_total=2000000, swap_free=0)  # ~1.9G swap used > 256M
+    line = soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[])
+    assert line and "swap" in line
