@@ -8,7 +8,7 @@ Mnemos=memory). This hook is proprioception: read the body, and when
 something is worth noticing, say so in one line. It senses, it never acts.
 
 Output (default pressure mode emits only when a threshold is crossed):
-  [system-state] mem 6.2G/61G avail(LOW) · swap 1.1G · top mnemos-mcp 15.5G(25%)(TOP) · / 71% · load 14/16(HIGH)
+  [system-state] mem 6.2G/61G avail(LOW) · swap 1.1G · top mnemos-mcp 15.5G(25.4%)(TOP) · / 71% · load 14/16(HIGH)
 
 A healthy box stays silent. Logic lives in soma_lib.py; this hook is just
 the renderer plus the emission log. It never raises into the prompt path.

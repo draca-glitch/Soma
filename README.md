@@ -17,7 +17,7 @@ It has memory (Mnemos) and a sense of time (Kairos), but no **proprioception**: 
 Before each prompt, Soma reads the body's state and, when something is worth noticing, injects one line:
 
 ```
-[system-state] mem 6.2G/61G avail(LOW) · swap 1.1G · top mnemos-mcp 15.5G(25%)(TOP) · / 71% · load 14/16(HIGH)
+[system-state] mem 6.2G/61G avail(LOW) · swap 1.1G · top mnemos-mcp 15.5G(25.4%)(TOP) · / 71% · load 14/16(HIGH)
 ```
 
 That single line front-loads a fact the agent would otherwise have to go dig for. It **senses; it never acts.** No restarts, no kills, no "you should". It states the body's condition and lets the agent decide, the same division of labor that makes a sense of time useful without being bossy.

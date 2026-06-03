@@ -229,7 +229,7 @@ def render(state: dict, a: dict) -> str:
     top = state.get("top")
     if top and total:
         tag = "(TOP)" if "TOP" in a["flags"] else ""
-        parts.append(f"top {top['name']} {human_kb(top['rss_kb'])}({a['top_pct']:.0f}%){tag}")
+        parts.append(f"top {top['name']} {human_kb(top['rss_kb'])}({a['top_pct']:.1f}%){tag}")
     worst = max(state.get("disks", []), key=lambda d: d["pct"], default=None)
     if worst:
         tag = "(HIGH)" if "DISK" in a["flags"] else ""

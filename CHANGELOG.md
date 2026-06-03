@@ -6,9 +6,12 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 ## [Unreleased]
 
-Nothing yet. v0.1.0 just shipped.
-
 Next probable: an emission-vs-behavior evaluator (replay `soma-log.jsonl` against transcripts) to measure whether body-state injection shifts decisions, the falsifiable test of whether the orienting mechanism generalizes off the time axis.
+
+## [0.1.1] - 2026-06-03
+
+### Fixed
+- `[system-state]` now shows the top-process RAM share to one decimal (e.g. `24.6%`) instead of rounding to a whole number. A true 24.6% rounded to `25%`, which read as if it sat at the `SOMA_TOP_RSS_PCT` threshold while the gate (correctly, on the true value) did not flag it. The decimal removes the apparent contradiction between the displayed number and the absent `(TOP)` flag.
 
 ## [0.1.0] - 2026-06-03
 
