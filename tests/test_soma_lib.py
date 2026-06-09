@@ -524,3 +524,44 @@ def test_render_self_and_numb_segments():
     line = soma_lib.render(state, a)
     assert "self claude[4] 30.5G(50.0%)(SELF)" in line
     assert "numb: /mnt/nas" in line
+
+
+def test_read_jiffies(tmp_path):
+    (tmp_path / "stat").write_text(
+        "cpu  100 0 50 800 10 0 5 35 0 0\ncpu0 50 0 25 400 5 0 2 17 0 0\n")
+    j = soma_lib.read_jiffies(str(tmp_path))
+    assert j == {"steal": 35, "total": 1000}
+
+
+def test_read_jiffies_missing(tmp_path):
+    assert soma_lib.read_jiffies(str(tmp_path)) is None
+
+
+def test_compute_trends_steal_pct():
+    state = _healthy_state(jiffies={"steal": 1350, "total": 11000})
+    anchor = _anchor(ts=0.0)
+    anchor["jiffies"] = {"steal": 350, "total": 1000}
+    t = soma_lib.compute_trends(state, anchor, now=3600.0)
+    assert t["steal_pct"] == 10.0  # 1000 steal of 10000 total delta
+
+
+def test_compute_trends_steal_guards_reset():
+    state = _healthy_state(jiffies={"steal": 10, "total": 100})  # rebooted, counters lower
+    anchor = _anchor(ts=0.0)
+    anchor["jiffies"] = {"steal": 350, "total": 1000}
+    assert "steal_pct" not in soma_lib.compute_trends(state, anchor, now=3600.0)
+
+
+def test_assess_and_render_steal():
+    state = _healthy_state()
+    a = soma_lib.assess(state, trends={"steal_pct": 22.0})
+    assert "STEAL" in a["flags"]
+    line = soma_lib.render(state, a)
+    assert "steal 22%(STEAL)" in line
+
+
+def test_render_steal_hidden_when_negligible():
+    state = _healthy_state()
+    a = soma_lib.assess(state, trends={"steal_pct": 0.1})
+    assert "STEAL" not in a["flags"]
+    assert "steal" not in soma_lib.render(state, a)

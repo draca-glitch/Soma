@@ -62,6 +62,7 @@ def thresholds() -> dict:
         "disk_ttf_h": _env_float("SOMA_DISK_TTF_H", 24.0),         # flag fill when a mount fills within this many hours
         "top_growth_gbh": _env_float("SOMA_TOP_GROWTH_GBH", 0.5),  # flag top-process growth above this GB/h; 0 disables
         "self_rss_pct": _env_float("SOMA_SELF_RSS_PCT", 40.0),     # own-process-tree RAM share ceiling; 0 disables
+        "steal_pct": _env_float("SOMA_STEAL_PCT", 10.0),           # hypervisor steal-share ceiling; 0 disables
     }
 
 
@@ -285,6 +286,24 @@ def read_counters(proc_root: str = "/proc", sys_root: str = "/sys") -> dict:
     return out
 
 
+def read_jiffies(proc_root: str = "/proc") -> dict | None:
+    """Aggregate cpu jiffies from /proc/stat. {steal, total} or None.
+
+    Steal only means something as a delta share; the trend anchor provides
+    the window. On dedicated hardware steal stays at 0 and the sense never
+    surfaces; on a virtualized guest it is the only way to feel the
+    hypervisor taking cycles while load average looks innocent.
+    """
+    try:
+        line = (Path(proc_root) / "stat").read_text().splitlines()[0]
+        fields = [int(x) for x in line.split()[1:]]
+    except (OSError, ValueError, IndexError):
+        return None
+    if len(fields) < 8:
+        return None
+    return {"steal": fields[7], "total": sum(fields)}
+
+
 def diff_events(counters: dict, prev: dict) -> dict:
     """Pain since the previous reading: positive counter deltas plus live degraded state.
 
@@ -311,6 +330,7 @@ def snapshot_anchor(state: dict, now: float) -> dict:
         "mem_avail_kb": mem.get("MemAvailable"),
         "disks": {d["mount"]: d["free_kb"] for d in state.get("disks", [])},
         "top": {"name": top["name"], "rss_kb": top["rss_kb"]} if top else None,
+        "jiffies": state.get("jiffies"),
     }
 
 
@@ -363,6 +383,12 @@ def compute_trends(state: dict, anchor: dict | None, now: float) -> dict:
     if (top and isinstance(a_top, dict) and top.get("name") == a_top.get("name")
             and a_top.get("rss_kb") is not None):
         out["top_gb_h"] = (top["rss_kb"] - a_top["rss_kb"]) / 1048576 / dt_h
+    jif, a_jif = state.get("jiffies"), anchor.get("jiffies")
+    if jif and isinstance(a_jif, dict) and a_jif.get("total") is not None:
+        d_total = jif["total"] - a_jif["total"]
+        d_steal = jif["steal"] - a_jif.get("steal", 0)
+        if d_total > 0 and d_steal >= 0:
+            out["steal_pct"] = d_steal / d_total * 100
     return out
 
 
@@ -476,6 +502,7 @@ def gather(proc_root: str = "/proc", mounts: list | None = None, services: list 
     state["temps"] = read_temps(hwmon_root)
     state["psi"] = read_psi(proc_root)
     state["counters"] = read_counters(proc_root, sys_root)
+    state["jiffies"] = read_jiffies(proc_root)
     return state
 
 
@@ -554,6 +581,8 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None,
             flags.add("FILL")
     if th["top_growth_gbh"] and trends.get("top_gb_h", 0.0) >= th["top_growth_gbh"]:
         flags.add("GROW")
+    if th["steal_pct"] and trends.get("steal_pct", 0.0) >= th["steal_pct"]:
+        flags.add("STEAL")
     return {
         "flags": flags,
         "mem_avail_pct": mem_avail_pct,
@@ -609,6 +638,10 @@ def render(state: dict, a: dict) -> str:
     load1 = state.get("load", (0.0,))[0]
     tag = "(HIGH)" if "LOAD" in a["flags"] else ""
     parts.append(f"load {load1:.1f}/{state.get('cores', 1)}{tag}")
+    steal = trends.get("steal_pct")
+    if steal is not None and (steal >= 0.5 or "STEAL" in a["flags"]):
+        tag = "(STEAL)" if "STEAL" in a["flags"] else ""
+        parts.append(f"steal {steal:.0f}%{tag}")
     psi = state.get("psi", {})
     if psi:
         tag = "(STRAIN:" + ",".join(sorted(a.get("strained", set()))) + ")" if "STRAIN" in a["flags"] else ""

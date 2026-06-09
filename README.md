@@ -34,6 +34,8 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Self vs world**: the RSS of the agent's own process tree, found by walking from the hook to the nearest harness ancestor (`SOMA_SELF_COMM`) and summing its whole subtree: the harness, the MCP servers it spawned (the agent's organs), and any tool subprocesses currently running (the agent's own effort). `self claude[14] 12.1G(19.5%)`; flags `SELF` past `SOMA_SELF_RSS_PCT`. "I am heavy" is a different fact from "the world is heavy", and the agent should know which one it is feeling.
 - **Numb limbs**: every mount probe runs in a watchdog thread under a shared deadline (`SOMA_MOUNT_TIMEOUT_MS`). A mount that stops answering (a network mount whose VPN dropped) is reported as `numb: /mnt/nas` with flag `NUMB` instead of hanging the hook, converting Soma's own worst failure mode into its most valuable mount signal. An agent that knows the limb is numb does not run the command that would have blocked on it.
 - **Movement**: rates of change against a rolling anchor (default 10 min window): RAM draining toward empty, a mount filling toward full, the top process growing. A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
+- **Steal** (virtualized hosts): hypervisor steal share over the trend window; see the VPS section below.
+- **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
 ## Two hooks, two cadences
 
@@ -42,10 +44,22 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 
 Both share `soma-state.json` (counter baselines, trend anchor, last flag set), so a condition announced at prompt time is not re-announced by the first pulse.
 
+## Virtualized hosts (VPS)
+
+Several senses go dark inside a guest, by design rather than by failure:
+
+- **Temperature**: hypervisors do not expose hwmon chips to guests; `read_temps()` returns `{}` and the segment never renders.
+- **ECC (EDAC)**: the memory controller belongs to the host; the guest kernel has no `edac` sysfs tree, so the counter is simply absent.
+- **RAID**: storage redundancy is the host's job; no `md` devices, no `RAID` flag.
+- **NVMe/disk sensors**: virtual block devices carry no drivetemp class.
+
+Everything absent degrades to a missing key and a missing line segment: a VPS deployment is quieter, never broken. What remains (PSI, OOM kills, swap, disk fill, numb mounts, self-vs-world, all trends) works identically, and PSI arguably matters more on shared infrastructure.
+
+One sense exists specifically FOR the VPS case: **steal**. `/proc/stat` steal jiffies measure cycles the hypervisor took while the guest had work to run, the only way to feel an oversold host from inside; load average looks innocent while the landlord throttles you. Rendered as `steal 12%` once it exceeds noise (0.5%), flagged `(STEAL)` past `SOMA_STEAL_PCT` (default 10). On dedicated hardware steal stays at 0 and the segment never appears.
+
 ## Measuring whether it works
 
 `analyze-emission-behavior.py` replays the emission log against session transcripts and reports, per flag class, how often the agent acknowledged the condition, acted on it, and how quickly, with healthy always-mode emissions as the control population. A flag class whose ack/act rates match the healthy control is a sense nobody uses; one that separates is measured behavior shift. This is Soma's falsifiability substrate: the project's premise (orienting injection generalizes beyond the time axis) is tested against its own production log, not asserted.
-- **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
 ## Design principles
 
@@ -64,6 +78,9 @@ Drop the hooks somewhere Claude Code can run them (e.g. `~/.claude/hooks/`) and 
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-state.py", "timeout": 2000 }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-pulse.py", "timeout": 2000 }] }
     ]
   }
 }
@@ -95,6 +112,7 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_SELF_RSS_PCT` | `40` | flag `SELF` when the agent's own process tree exceeds this percent of total RAM; `0` disables |
 | `SOMA_SELF_COMM` | `claude,node` | comm names recognized as the harness ancestor when walking up from the hook |
 | `SOMA_MOUNT_TIMEOUT_MS` | `150` | shared deadline for all mount probes; a probe that misses it reports the mount as numb |
+| `SOMA_STEAL_PCT` | `10` | flag `STEAL` when hypervisor steal share over the trend window crosses this percent; `0` disables |
 | `SOMA_MOUNTS` | `/,/root/work` | comma-separated mounts to check (duplicate filesystems are deduped) |
 | `SOMA_SERVICES` | *(empty)* | comma-separated services to probe; empty means no `systemctl` call |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |

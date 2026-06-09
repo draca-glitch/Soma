@@ -8,6 +8,15 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+## [0.8.0] - 2026-06-10
+
+The shared-apartment release: what a guest can and cannot feel.
+
+### Added
+- **Steal sense.** `read_jiffies()` reads aggregate cpu jiffies from `/proc/stat`; `compute_trends()` derives the hypervisor steal share over the trend-anchor window. Rendered as `steal 12%` once above noise (0.5%), flagged `STEAL` past `SOMA_STEAL_PCT` (default 10, `0` disables). Steal is the one sense that exists specifically for virtualized guests: cycles the host took while the guest had work to run, invisible to load average. On dedicated hardware it stays at 0 and the segment never renders. Counter resets (reboot) are guarded.
+- **README section on virtualized hosts**: temperature, EDAC, RAID, and disk-sensor classes go dark inside a guest by design (the hypervisor owns that hardware); each degrades to an absent key and an absent segment, so a VPS deployment is quieter, never broken. PSI, OOM, swap, disk fill, numb mounts, self-vs-world, and all trends work identically.
+- 6 new tests (61 total).
+
 ## [0.7.0] - 2026-06-10
 
 The falsifiability layer. Soma now measures whether anyone listens to it.
