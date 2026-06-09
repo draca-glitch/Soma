@@ -29,6 +29,8 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Disk**: percent-used on a small mount watchlist.
 - **Load**: 1-minute load average against core count.
 - **Temperature**: hottest sensor per class (CPU, disk, GPU) from sysfs hwmon, when the kernel exposes them. The body's fever check: a `(HOT)` tag on the class that crossed its ceiling.
+- **Strain**: PSI stall shares (`/proc/pressure`, `some` avg10) for cpu/memory/io. The felt difference between busy-and-fine (high load, zero stall) and wedged (low load, high stall), which load average cannot express. Rendered as `psi 1/0/38%` in cpu/mem/io order.
+- **Pain**: damage events since the previous reading, from kernel counters: OOM kills (`/proc/vmstat`), ECC corrected/uncorrected memory errors (EDAC), and a degraded md RAID array. Levels are sensations; these are injuries. Counter baselines persist in `soma-state.json`, so an event is reported exactly once, at the next prompt after it happened.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
 ## Design principles
@@ -70,6 +72,7 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_TEMP_CPU` | `85` | degC ceiling for the CPU sensor class (k10temp, coretemp, ...); `0` disables |
 | `SOMA_TEMP_DISK` | `70` | degC ceiling for the disk sensor class (nvme, drivetemp); `0` disables |
 | `SOMA_TEMP_GPU` | `90` | degC ceiling for the GPU sensor class (amdgpu, i915, ...); `0` disables |
+| `SOMA_PSI_PCT` | `25` | flag `STRAIN` when any PSI `some` avg10 stall share crosses this percent; `0` disables |
 | `SOMA_MOUNTS` | `/,/root/work` | comma-separated mounts to check (duplicate filesystems are deduped) |
 | `SOMA_SERVICES` | *(empty)* | comma-separated services to probe; empty means no `systemctl` call |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |

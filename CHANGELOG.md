@@ -8,6 +8,17 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: an emission-vs-behavior evaluator (replay `soma-log.jsonl` against transcripts) to measure whether body-state injection shifts decisions, the falsifiable test of whether the orienting mechanism generalizes off the time axis.
 
+## [0.3.0] - 2026-06-09
+
+Two new senses, plus the persistence they require. Proprioception is not just position (levels); this release adds strain (how hard is the body working to stand still) and pain (what got damaged since you last checked).
+
+### Added
+- **Strain sense: PSI.** `read_psi()` parses `/proc/pressure/{cpu,memory,io}` (`some` avg10). New segment `psi 1/0/38%` (cpu/mem/io order); any resource crossing `SOMA_PSI_PCT` (default 25, `0` disables) flags `STRAIN` with the offenders named, e.g. `(STRAIN:io)`. PSI separates busy-and-fine from wedged, which load average structurally cannot. Absent on kernels without CONFIG_PSI; the segment simply does not render.
+- **Pain channel: damage events via counter deltas.** `read_counters()` reads lifetime counters (`oom_kill` from `/proc/vmstat`, ECC corrected/uncorrected error counts from EDAC sysfs) and the live `md*/md/degraded` state. `diff_events()` reports positive deltas against the previous reading: flags `OOM`, `ECC`, `RAID`; rendered as e.g. `pain oom-kill 2 ecc-ce +3`. Acute events fire exactly once (the baseline then advances); a degraded array is chronic and reported every reading until rebuilt. Counter resets (reboot) produce no false pain. First run establishes the baseline silently.
+- **Persisted state.** `soma-state.json` in the state dir (atomic replace, never raises) carries the counter baseline between readings; foundation for trend rates in the next release.
+- `gather()`/`line_for_mode()` take `sys_root` and `state_dir` parameters for hermetic tests.
+- 9 new tests (31 total).
+
 ## [0.2.0] - 2026-06-09
 
 ### Added

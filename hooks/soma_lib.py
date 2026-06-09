@@ -55,6 +55,7 @@ def thresholds() -> dict:
         "temp_cpu": _env_float("SOMA_TEMP_CPU", 85.0),             # degC ceilings per sensor class; 0 disables a class
         "temp_disk": _env_float("SOMA_TEMP_DISK", 70.0),
         "temp_gpu": _env_float("SOMA_TEMP_GPU", 90.0),
+        "psi_pct": _env_float("SOMA_PSI_PCT", 25.0),               # PSI some/avg10 stall-share ceiling; 0 disables
     }
 
 
@@ -127,6 +128,111 @@ def disk_usage(paths: list) -> list:
     return out
 
 
+def read_psi(proc_root: str = "/proc") -> dict:
+    """Stall share per resource from /proc/pressure, "some" avg10. {cpu|memory|io: pct}.
+
+    PSI is the strain sense: the percent of the last 10s in which at least
+    one task stalled waiting on the resource. It separates busy-and-fine
+    (high load, zero stall) from wedged (low load, high stall), which load
+    average cannot. Absent on kernels without CONFIG_PSI; keys are simply
+    missing then.
+    """
+    out = {}
+    for res in ("cpu", "memory", "io"):
+        try:
+            text = (Path(proc_root) / "pressure" / res).read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("some "):
+                for tok in line.split():
+                    if tok.startswith("avg10="):
+                        try:
+                            out[res] = float(tok.split("=", 1)[1])
+                        except ValueError:
+                            pass
+                break
+    return out
+
+
+def read_counters(proc_root: str = "/proc", sys_root: str = "/sys") -> dict:
+    """Damage counters and degraded-state levels for the pain channel.
+
+    oom_kill / edac_ce / edac_ue are lifetime counters, meaningful only as
+    deltas against the previous reading; md_degraded is a current level.
+    Keys are absent when the kernel does not expose the source.
+    """
+    out = {}
+    try:
+        for line in (Path(proc_root) / "vmstat").read_text().splitlines():
+            if line.startswith("oom_kill "):
+                out["oom_kill"] = int(line.split()[1])
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    for kind in ("ce", "ue"):
+        total = None
+        for f in Path(sys_root, "devices/system/edac/mc").glob(f"mc*/{kind}_count"):
+            try:
+                total = (total or 0) + int(f.read_text().strip())
+            except (OSError, ValueError):
+                continue
+        if total is not None:
+            out[f"edac_{kind}"] = total
+    degraded = None
+    for f in Path(sys_root, "block").glob("md*/md/degraded"):
+        try:
+            degraded = (degraded or 0) + int(f.read_text().strip())
+        except (OSError, ValueError):
+            continue
+    if degraded is not None:
+        out["md_degraded"] = degraded
+    return out
+
+
+def diff_events(counters: dict, prev: dict) -> dict:
+    """Pain since the previous reading: positive counter deltas plus live degraded state.
+
+    Negative deltas (counter reset after reboot) are dropped. An empty prev
+    (first run) yields no deltas; the baseline simply starts.
+    """
+    ev = {}
+    for key in ("oom_kill", "edac_ce", "edac_ue"):
+        if key in counters and key in prev:
+            d = counters[key] - prev[key]
+            if d > 0:
+                ev[key] = d
+    if counters.get("md_degraded", 0) > 0:
+        ev["md_degraded"] = counters["md_degraded"]
+    return ev
+
+
+def _state_dir(state_dir: str | None = None) -> Path:
+    return Path(state_dir or os.environ.get("SOMA_STATE_DIR")
+                or os.environ.get("CLAUDE_KIT_STATE_DIR", str(Path.home() / ".claude" / "state")))
+
+
+def load_state(state_dir: str | None = None) -> dict:
+    """Previously persisted reading (counter baseline, trend anchor). {} when absent or corrupt."""
+    try:
+        doc = json.loads((_state_dir(state_dir) / "soma-state.json").read_text())
+        return doc if isinstance(doc, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(doc: dict, state_dir: str | None = None) -> None:
+    """Persist the reading for the next run's deltas. Atomic replace, never raises."""
+    try:
+        d = _state_dir(state_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / "soma-state.json.tmp"
+        tmp.write_text(json.dumps(doc))
+        tmp.replace(d / "soma-state.json")
+    except Exception:
+        return
+
+
 # hwmon chip name -> sensor class. Only classes with a threshold are read;
 # anything else (VRM, chipset, ACPI zones) stays out of the line.
 CHIP_CLASSES = {
@@ -189,7 +295,7 @@ def human_kb(kb: float) -> str:
 
 
 def gather(proc_root: str = "/proc", mounts: list | None = None, services: list | None = None,
-           hwmon_root: str = "/sys/class/hwmon") -> dict:
+           hwmon_root: str = "/sys/class/hwmon", sys_root: str = "/sys") -> dict:
     """Read the body's current state. Never raises; missing pieces are absent keys."""
     mounts = mounts if mounts is not None else _env_list("SOMA_MOUNTS", ["/", "/root/work"])
     services = services if services is not None else _env_list("SOMA_SERVICES", [])
@@ -206,6 +312,8 @@ def gather(proc_root: str = "/proc", mounts: list | None = None, services: list 
     state["disks"] = disk_usage(mounts)
     state["services"] = service_states(services)
     state["temps"] = read_temps(hwmon_root)
+    state["psi"] = read_psi(proc_root)
+    state["counters"] = read_counters(proc_root, sys_root)
     return state
 
 
@@ -216,8 +324,8 @@ def _env_list(name: str, default: list) -> list:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
-def assess(state: dict, th: dict | None = None) -> dict:
-    """Flag which conditions cross a threshold. {flags: set, mem_avail_pct, swap_mb, load_ratio, top_pct}."""
+def assess(state: dict, th: dict | None = None, events: dict | None = None) -> dict:
+    """Flag which conditions cross a threshold. {flags: set, mem_avail_pct, swap_mb, load_ratio, top_pct, hot, strained, events}."""
     th = th or thresholds()
     flags = set()
     mem = state.get("mem", {})
@@ -253,6 +361,18 @@ def assess(state: dict, th: dict | None = None) -> dict:
             hot.add(cls)
     if hot:
         flags.add("HOT")
+    strained = set()
+    if th["psi_pct"]:
+        strained = {res for res, pct in state.get("psi", {}).items() if pct >= th["psi_pct"]}
+    if strained:
+        flags.add("STRAIN")
+    events = events or {}
+    if events.get("oom_kill"):
+        flags.add("OOM")
+    if events.get("edac_ce") or events.get("edac_ue"):
+        flags.add("ECC")
+    if events.get("md_degraded"):
+        flags.add("RAID")
     return {
         "flags": flags,
         "mem_avail_pct": mem_avail_pct,
@@ -260,6 +380,8 @@ def assess(state: dict, th: dict | None = None) -> dict:
         "load_ratio": load_ratio,
         "top_pct": top_pct,
         "hot": hot,
+        "strained": strained,
+        "events": events,
     }
 
 
@@ -288,6 +410,10 @@ def render(state: dict, a: dict) -> str:
     load1 = state.get("load", (0.0,))[0]
     tag = "(HIGH)" if "LOAD" in a["flags"] else ""
     parts.append(f"load {load1:.1f}/{state.get('cores', 1)}{tag}")
+    psi = state.get("psi", {})
+    if psi:
+        tag = "(STRAIN:" + ",".join(sorted(a.get("strained", set()))) + ")" if "STRAIN" in a["flags"] else ""
+        parts.append("psi " + "/".join(f"{psi.get(r, 0):.0f}" for r in ("cpu", "memory", "io")) + f"%{tag}")
     temps = state.get("temps", {})
     if temps:
         hot = a.get("hot", set())
@@ -296,6 +422,18 @@ def render(state: dict, a: dict) -> str:
             for cls, deg in sorted(temps.items())
         )
         parts.append(f"temp {seg}°C")
+    ev = a.get("events", {})
+    if ev:
+        labels = []
+        if "oom_kill" in ev:
+            labels.append(f"oom-kill {ev['oom_kill']}")
+        if "edac_ce" in ev:
+            labels.append(f"ecc-ce +{ev['edac_ce']}")
+        if "edac_ue" in ev:
+            labels.append(f"ecc-ue +{ev['edac_ue']}")
+        if "md_degraded" in ev:
+            labels.append("raid-degraded")
+        parts.append("pain " + " ".join(labels))
     down = [n for n, s in state.get("services", []) if s not in ("active", "unknown")]
     if down:
         parts.append("svc-down: " + ",".join(down))
@@ -303,14 +441,21 @@ def render(state: dict, a: dict) -> str:
 
 
 def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=None,
-                  hwmon_root: str = "/sys/class/hwmon") -> str | None:
-    """Top-level: gather, assess, return the line to print or None to stay silent."""
+                  hwmon_root: str = "/sys/class/hwmon", sys_root: str = "/sys",
+                  state_dir: str | None = None) -> str | None:
+    """Top-level: gather, diff against the persisted baseline, assess, persist,
+    return the line to print or None to stay silent."""
     if mode == "off":
         return None
-    state = gather(proc_root, mounts, services, hwmon_root)
-    a = assess(state)
+    state = gather(proc_root, mounts, services, hwmon_root, sys_root)
+    prev = load_state(state_dir)
+    events = diff_events(state.get("counters", {}), prev.get("counters", {}))
+    a = assess(state, events=events)
+    save_state({"counters": state.get("counters", {})}, state_dir)
     if mode == "always" or a["flags"]:
-        return render(state, a)
+        line = render(state, a)
+        log_emission(line, a["flags"], state_dir)
+        return line
     return None
 
 
@@ -320,8 +465,7 @@ def log_emission(line: str, flags: set, state_dir: str | None = None) -> None:
         return
     try:
         from datetime import datetime, timezone
-        d = Path(state_dir or os.environ.get("SOMA_STATE_DIR")
-                 or os.environ.get("CLAUDE_KIT_STATE_DIR", str(Path.home() / ".claude" / "state")))
+        d = _state_dir(state_dir)
         d.mkdir(parents=True, exist_ok=True)
         rec = {"ts": datetime.now(timezone.utc).astimezone().isoformat(),
                "flags": sorted(flags), "line": line}

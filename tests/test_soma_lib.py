@@ -135,23 +135,25 @@ def test_line_for_mode_off():
     assert soma_lib.line_for_mode("off") is None
 
 
+def _lfm(mode, proc, **kw):
+    return soma_lib.line_for_mode(
+        mode, proc_root=str(proc), mounts=[], services=[],
+        hwmon_root=str(proc / "no-hwmon"), sys_root=str(proc / "no-sys"),
+        state_dir=str(proc / "state"), **kw)
+
+
 def test_line_for_mode_pressure_silent_on_healthy(tmp_path):
-    proc = _fake_proc(tmp_path)
-    assert soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[],
-                                  hwmon_root=str(proc / "no-hwmon")) is None
+    assert _lfm("pressure", _fake_proc(tmp_path)) is None
 
 
 def test_line_for_mode_always_emits_on_healthy(tmp_path):
-    proc = _fake_proc(tmp_path)
-    line = soma_lib.line_for_mode("always", proc_root=str(proc), mounts=[], services=[],
-                                  hwmon_root=str(proc / "no-hwmon"))
+    line = _lfm("always", _fake_proc(tmp_path))
     assert line and line.startswith("[system-state]")
 
 
 def test_line_for_mode_pressure_emits_on_swap(tmp_path):
     proc = _fake_proc(tmp_path, swap_total=2000000, swap_free=0)  # ~1.9G swap used > 256M
-    line = soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[],
-                                  hwmon_root=str(proc / "no-hwmon"))
+    line = _lfm("pressure", proc)
     assert line and "swap" in line
 
 
@@ -221,3 +223,91 @@ def test_render_no_temp_segment_when_absent():
     state = _healthy_state()
     a = soma_lib.assess(state)
     assert "temp" not in soma_lib.render(state, a)
+
+
+def _fake_psi(proc, cpu="0.00", mem="0.00", io="0.00"):
+    d = proc / "pressure"
+    d.mkdir(exist_ok=True)
+    for res, v in (("cpu", cpu), ("memory", mem), ("io", io)):
+        (d / res).write_text(
+            f"some avg10={v} avg60=0.00 avg300=0.00 total=1\n"
+            f"full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+    return proc
+
+
+def test_read_psi(tmp_path):
+    _fake_psi(tmp_path, cpu="1.50", io="38.20")
+    assert soma_lib.read_psi(str(tmp_path)) == {"cpu": 1.5, "memory": 0.0, "io": 38.2}
+
+
+def test_read_psi_missing(tmp_path):
+    assert soma_lib.read_psi(str(tmp_path)) == {}
+
+
+def _fake_sys(tmp_path, ce=None, ue=None, degraded=None):
+    sys_root = tmp_path / "sys"
+    if ce is not None or ue is not None:
+        mc = sys_root / "devices/system/edac/mc/mc0"
+        mc.mkdir(parents=True)
+        if ce is not None:
+            (mc / "ce_count").write_text(f"{ce}\n")
+        if ue is not None:
+            (mc / "ue_count").write_text(f"{ue}\n")
+    if degraded is not None:
+        md = sys_root / "block/md0/md"
+        md.mkdir(parents=True)
+        (md / "degraded").write_text(f"{degraded}\n")
+    return str(sys_root)
+
+
+def test_read_counters(tmp_path):
+    (tmp_path / "vmstat").write_text("nr_free_pages 100\noom_kill 7\n")
+    sys_root = _fake_sys(tmp_path, ce=3, ue=0, degraded=1)
+    c = soma_lib.read_counters(str(tmp_path), sys_root)
+    assert c == {"oom_kill": 7, "edac_ce": 3, "edac_ue": 0, "md_degraded": 1}
+
+
+def test_read_counters_absent_sources(tmp_path):
+    assert soma_lib.read_counters(str(tmp_path), str(tmp_path / "sys")) == {}
+
+
+def test_diff_events():
+    cur = {"oom_kill": 9, "edac_ce": 5, "edac_ue": 0, "md_degraded": 0}
+    prev = {"oom_kill": 7, "edac_ce": 5, "edac_ue": 0, "md_degraded": 0}
+    assert soma_lib.diff_events(cur, prev) == {"oom_kill": 2}
+    assert soma_lib.diff_events(cur, {}) == {}  # first run, baseline only
+    reset = {"oom_kill": 1, "edac_ce": 0, "edac_ue": 0}
+    assert soma_lib.diff_events(reset, prev) == {}  # counter reset, no negative pain
+    assert soma_lib.diff_events({"md_degraded": 1}, {"md_degraded": 1}) == {"md_degraded": 1}  # chronic
+
+
+def test_assess_strain_and_pain_flags():
+    state = _healthy_state(psi={"cpu": 1.0, "memory": 0.0, "io": 40.0})
+    a = soma_lib.assess(state, events={"oom_kill": 1, "edac_ce": 2})
+    assert {"STRAIN", "OOM", "ECC"} <= a["flags"]
+    assert a["strained"] == {"io"}
+
+
+def test_render_psi_and_pain_segments():
+    state = _healthy_state(psi={"cpu": 1.0, "memory": 0.0, "io": 40.0})
+    a = soma_lib.assess(state, events={"oom_kill": 2, "md_degraded": 1})
+    line = soma_lib.render(state, a)
+    assert "psi 1/0/40%(STRAIN:io)" in line
+    assert "pain oom-kill 2 raid-degraded" in line
+
+
+def test_state_roundtrip(tmp_path):
+    soma_lib.save_state({"counters": {"oom_kill": 1}}, str(tmp_path))
+    assert soma_lib.load_state(str(tmp_path)) == {"counters": {"oom_kill": 1}}
+    (tmp_path / "soma-state.json").write_text("not json{")
+    assert soma_lib.load_state(str(tmp_path)) == {}
+
+
+def test_line_for_mode_pressure_emits_on_oom_delta(tmp_path):
+    proc = _fake_proc(tmp_path)
+    (proc / "vmstat").write_text("oom_kill 5\n")
+    assert _lfm("pressure", proc) is None  # first run: baseline, no pain
+    (proc / "vmstat").write_text("oom_kill 6\n")
+    line = _lfm("pressure", proc)
+    assert line and "pain oom-kill 1" in line
+    assert _lfm("pressure", proc) is None  # delta consumed, silent again

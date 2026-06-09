@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from soma_lib import gather, assess, render, log_emission
+from soma_lib import line_for_mode
 
 
 def main() -> int:
@@ -42,12 +42,9 @@ def main() -> int:
         return 0
 
     try:
-        state = gather()
-        a = assess(state)
-        if mode == "always" or a["flags"]:
-            line = render(state, a)
+        line = line_for_mode(mode)
+        if line:
             print(line)
-            log_emission(line, a["flags"])
     except Exception:
         return 0
     return 0
