@@ -8,6 +8,16 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: an emission-vs-behavior evaluator (replay `soma-log.jsonl` against transcripts) to measure whether body-state injection shifts decisions, the falsifiable test of whether the orienting mechanism generalizes off the time axis.
 
+## [0.5.0] - 2026-06-09
+
+Sampling while moving. Until now Soma only fired when the human spoke; the body changes most while the AGENT acts (builds, benches, parallel subagents), and that entire window was blind.
+
+### Added
+- **`hooks/soma-pulse.py` (PostToolUse).** Samples the body after every tool call, emits only on a flag transition: a flag appeared, or a chronic condition cleared (one recovery line). Acute pain flags (OOM, ECC) clearing is the delta baseline advancing, not a recovery, and stays silent; `should_pulse()` encodes the gate. A long healthy turn costs zero lines. `SOMA_PULSE=transition|off`.
+- `last_flags` persisted in `soma-state.json` by both hooks, so a condition announced at prompt time is not re-announced by the first pulse, and vice versa.
+- Emission log records gain a `src` field (`state` or `pulse`) so the evaluator can separate prompt-time orientation from mid-turn interruption when measuring behavior shift.
+- 3 new tests (42 total).
+
 ## [0.4.0] - 2026-06-09
 
 The movement sense. Proprioception detects velocity, not just position: "85% used" is ambiguous, "full in ~6h" is actionable. Builds on the state file introduced in 0.3.0.

@@ -398,3 +398,48 @@ def test_line_for_mode_trend_integration(tmp_path):
         hwmon_root=str(proc2 / "no-hwmon"), sys_root=str(proc2 / "no-sys"),
         state_dir=str(proc / "state"), now=3600.0)
     assert line and "(DRAIN)" in line
+
+
+def test_should_pulse():
+    assert soma_lib.should_pulse(set(), {"HOT"})                     # appeared
+    assert not soma_lib.should_pulse({"HOT"}, {"HOT"})               # unchanged
+    assert not soma_lib.should_pulse({"OOM"}, set())                 # acute consumed, not recovery
+    assert soma_lib.should_pulse({"DISK"}, set())                    # chronic cleared
+    assert soma_lib.should_pulse({"OOM", "DISK"}, {"DISK", "HOT"})   # HOT appeared
+    assert not soma_lib.should_pulse({"OOM", "DISK"}, {"DISK"})      # only acute cleared
+
+
+def _pulse(proc, **kw):
+    return soma_lib.pulse_line(
+        proc_root=str(proc), mounts=[], services=[],
+        hwmon_root=str(proc / "no-hwmon"), sys_root=str(proc / "no-sys"),
+        state_dir=str(proc.parent / "state"), **kw)
+
+
+def test_pulse_transition_gate(tmp_path):
+    healthy = tmp_path / "a"
+    healthy.mkdir()
+    _fake_proc(healthy)
+    assert _pulse(healthy, now=0.0) is None  # healthy baseline, no transition
+
+    swapping = tmp_path / "b"
+    swapping.mkdir()
+    _fake_proc(swapping, swap_total=2000000, swap_free=0)
+    line = _pulse(swapping, now=10.0)
+    assert line and "swap" in line  # SWAP appeared mid-turn
+
+    assert _pulse(swapping, now=20.0) is None  # condition persists, no re-emission
+
+    recovered = tmp_path / "c"
+    recovered.mkdir()
+    _fake_proc(recovered)
+    line = _pulse(recovered, now=30.0)
+    assert line and "swap 0" in line  # chronic condition cleared, one recovery line
+
+    assert _pulse(recovered, now=40.0) is None  # healthy steady state, silent
+
+
+def test_pulse_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOMA_PULSE", "off")
+    proc = _fake_proc(tmp_path)
+    assert _pulse(proc, now=0.0) is None

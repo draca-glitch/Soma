@@ -32,6 +32,13 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Strain**: PSI stall shares (`/proc/pressure`, `some` avg10) for cpu/memory/io. The felt difference between busy-and-fine (high load, zero stall) and wedged (low load, high stall), which load average cannot express. Rendered as `psi 1/0/38%` in cpu/mem/io order.
 - **Pain**: damage events since the previous reading, from kernel counters: OOM kills (`/proc/vmstat`), ECC corrected/uncorrected memory errors (EDAC), and a degraded md RAID array. Levels are sensations; these are injuries. Counter baselines persist in `soma-state.json`, so an event is reported exactly once, at the next prompt after it happened.
 - **Movement**: rates of change against a rolling anchor (default 10 min window): RAM draining toward empty, a mount filling toward full, the top process growing. A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
+
+## Two hooks, two cadences
+
+- `soma-state.py` (UserPromptSubmit): orients at prompt time, gated by `SOMA_MODE`.
+- `soma-pulse.py` (PostToolUse): samples mid-turn, while the agent is acting, which is exactly when the agent itself is loading the box. Emits only on a flag **transition** (something appeared, or a chronic condition cleared), so a long healthy turn costs zero lines and a persisting condition is not repeated every tool call. An acute pain flag clearing is just the delta baseline advancing and does not count as a recovery. Gated by `SOMA_PULSE`.
+
+Both share `soma-state.json` (counter baselines, trend anchor, last flag set), so a condition announced at prompt time is not re-announced by the first pulse.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
 ## Design principles
@@ -65,6 +72,7 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `SOMA_MODE` | `pressure` | `pressure` (quiet unless notable), `always` (emit every turn), `off` |
+| `SOMA_PULSE` | `transition` | mid-turn hook gate: `transition` (emit when a flag appears or a chronic one clears), `off` |
 | `SOMA_MEM_AVAIL_PCT` | `15` | flag when available RAM drops below this percent of total |
 | `SOMA_SWAP_MB` | `256` | flag when swap-in-use exceeds this many MB |
 | `SOMA_DISK_PCT` | `85` | flag when any watched mount exceeds this percent used |

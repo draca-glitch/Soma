@@ -545,7 +545,9 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     events = diff_events(state.get("counters", {}), prev.get("counters", {}))
     trends = compute_trends(state, prev.get("anchor"), now)
     a = assess(state, events=events, trends=trends)
-    save_state(roll_state(prev, state, now), state_dir)
+    doc = roll_state(prev, state, now)
+    doc["last_flags"] = sorted(a["flags"])
+    save_state(doc, state_dir)
     if mode == "always" or a["flags"]:
         line = render(state, a)
         log_emission(line, a["flags"], state_dir)
@@ -553,7 +555,47 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     return None
 
 
-def log_emission(line: str, flags: set, state_dir: str | None = None) -> None:
+# Acute pain flags: their clearing is the delta baseline advancing, not a
+# recovery. Everything else clearing is a condition genuinely passing.
+ACUTE_FLAGS = {"OOM", "ECC"}
+
+
+def should_pulse(prev_flags: set, cur_flags: set) -> bool:
+    """Mid-turn emission gate: a flag appeared, or a chronic condition cleared."""
+    appeared = cur_flags - prev_flags
+    recovered = (prev_flags - cur_flags) - ACUTE_FLAGS
+    return bool(appeared or recovered)
+
+
+def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
+               hwmon_root: str = "/sys/class/hwmon", sys_root: str = "/sys",
+               state_dir: str | None = None, now: float | None = None) -> str | None:
+    """Mid-turn proprioception for PostToolUse: emit only on flag transitions.
+
+    The prompt-time hook re-orients at every prompt; at tool cadence that
+    would be spam. This emits only when the body's condition changes while
+    the agent is acting: something crossed a threshold, or a chronic
+    condition passed. A long healthy turn costs zero lines.
+    """
+    if os.environ.get("SOMA_PULSE", "transition") == "off":
+        return None
+    now = now if now is not None else time.time()
+    state = gather(proc_root, mounts, services, hwmon_root, sys_root)
+    prev = load_state(state_dir)
+    events = diff_events(state.get("counters", {}), prev.get("counters", {}))
+    trends = compute_trends(state, prev.get("anchor"), now)
+    a = assess(state, events=events, trends=trends)
+    doc = roll_state(prev, state, now)
+    doc["last_flags"] = sorted(a["flags"])
+    save_state(doc, state_dir)
+    if should_pulse(set(prev.get("last_flags", [])), a["flags"]):
+        line = render(state, a)
+        log_emission(line, a["flags"], state_dir, src="pulse")
+        return line
+    return None
+
+
+def log_emission(line: str, flags: set, state_dir: str | None = None, src: str = "state") -> None:
     """Append an emission record (falsifiability substrate). Never raises."""
     if os.environ.get("SOMA_LOG", "1") != "1":
         return
@@ -562,7 +604,7 @@ def log_emission(line: str, flags: set, state_dir: str | None = None) -> None:
         d = _state_dir(state_dir)
         d.mkdir(parents=True, exist_ok=True)
         rec = {"ts": datetime.now(timezone.utc).astimezone().isoformat(),
-               "flags": sorted(flags), "line": line}
+               "flags": sorted(flags), "line": line, "src": src}
         with open(d / "soma-log.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception:
