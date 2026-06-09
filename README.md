@@ -31,6 +31,7 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Temperature**: hottest sensor per class (CPU, disk, GPU) from sysfs hwmon, when the kernel exposes them. The body's fever check: a `(HOT)` tag on the class that crossed its ceiling.
 - **Strain**: PSI stall shares (`/proc/pressure`, `some` avg10) for cpu/memory/io. The felt difference between busy-and-fine (high load, zero stall) and wedged (low load, high stall), which load average cannot express. Rendered as `psi 1/0/38%` in cpu/mem/io order.
 - **Pain**: damage events since the previous reading, from kernel counters: OOM kills (`/proc/vmstat`), ECC corrected/uncorrected memory errors (EDAC), and a degraded md RAID array. Levels are sensations; these are injuries. Counter baselines persist in `soma-state.json`, so an event is reported exactly once, at the next prompt after it happened.
+- **Movement**: rates of change against a rolling anchor (default 10 min window): RAM draining toward empty, a mount filling toward full, the top process growing. A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
 ## Design principles
@@ -73,6 +74,10 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_TEMP_DISK` | `70` | degC ceiling for the disk sensor class (nvme, drivetemp); `0` disables |
 | `SOMA_TEMP_GPU` | `90` | degC ceiling for the GPU sensor class (amdgpu, i915, ...); `0` disables |
 | `SOMA_PSI_PCT` | `25` | flag `STRAIN` when any PSI `some` avg10 stall share crosses this percent; `0` disables |
+| `SOMA_MEM_TTE_H` | `2` | flag `DRAIN` when RAM would empty within this many hours (and is already below half) |
+| `SOMA_DISK_TTF_H` | `24` | flag `FILL` when a watched mount would fill within this many hours |
+| `SOMA_TOP_GROWTH_GBH` | `0.5` | flag `GROW` when the top process gains RSS faster than this many GB/h; `0` disables |
+| `SOMA_TREND_ANCHOR_S` | `600` | rolling anchor age for rate computation; rates are measured over at least this window |
 | `SOMA_MOUNTS` | `/,/root/work` | comma-separated mounts to check (duplicate filesystems are deduped) |
 | `SOMA_SERVICES` | *(empty)* | comma-separated services to probe; empty means no `systemctl` call |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |

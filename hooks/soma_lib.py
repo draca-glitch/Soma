@@ -25,6 +25,7 @@ Design rules (mirrors the sibling Kairos):
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 PAGE_KB = (os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096) / 1024
@@ -56,6 +57,9 @@ def thresholds() -> dict:
         "temp_disk": _env_float("SOMA_TEMP_DISK", 70.0),
         "temp_gpu": _env_float("SOMA_TEMP_GPU", 90.0),
         "psi_pct": _env_float("SOMA_PSI_PCT", 25.0),               # PSI some/avg10 stall-share ceiling; 0 disables
+        "mem_tte_h": _env_float("SOMA_MEM_TTE_H", 2.0),            # flag drain when RAM empties within this many hours
+        "disk_ttf_h": _env_float("SOMA_DISK_TTF_H", 24.0),         # flag fill when a mount fills within this many hours
+        "top_growth_gbh": _env_float("SOMA_TOP_GROWTH_GBH", 0.5),  # flag top-process growth above this GB/h; 0 disables
     }
 
 
@@ -207,6 +211,70 @@ def diff_events(counters: dict, prev: dict) -> dict:
     return ev
 
 
+def snapshot_anchor(state: dict, now: float) -> dict:
+    """Reference point for rates: timestamp plus the level readings that trend."""
+    mem = state.get("mem", {})
+    top = state.get("top")
+    return {
+        "ts": now,
+        "mem_avail_kb": mem.get("MemAvailable"),
+        "disks": {d["mount"]: d["free_kb"] for d in state.get("disks", [])},
+        "top": {"name": top["name"], "rss_kb": top["rss_kb"]} if top else None,
+    }
+
+
+def roll_state(prev: dict, state: dict, now: float, anchor_s: int | None = None) -> dict:
+    """Next persisted state doc. Counters refresh every reading; the trend
+    anchor only when it has aged past anchor_s, so rates are measured over a
+    stable window even when readings come seconds apart."""
+    anchor_s = anchor_s if anchor_s is not None else _env_int("SOMA_TREND_ANCHOR_S", 600)
+    anchor = prev.get("anchor")
+    if (not isinstance(anchor, dict) or (now - anchor.get("ts", 0)) >= anchor_s
+            or anchor.get("ts", 0) > now):
+        anchor = snapshot_anchor(state, now)
+    return {"counters": state.get("counters", {}), "anchor": anchor}
+
+
+def compute_trends(state: dict, anchor: dict | None, now: float) -> dict:
+    """Movement sense: rates of change against the anchor, in GB/h.
+
+    mem_gb_h negative = draining (mem_tte_h = hours to empty at that rate);
+    per-mount gb_h positive = filling (ttf_h = hours to full); top_gb_h only
+    when the same process is still the top consumer. {} when the anchor is
+    missing or under a minute old (rates would be noise).
+    """
+    if not isinstance(anchor, dict):
+        return {}
+    dt_h = (now - anchor.get("ts", now)) / 3600.0
+    if dt_h < 1 / 60:
+        return {}
+    out = {}
+    avail = state.get("mem", {}).get("MemAvailable")
+    a_avail = anchor.get("mem_avail_kb")
+    if avail is not None and a_avail is not None:
+        rate = (avail - a_avail) / 1048576 / dt_h
+        out["mem_gb_h"] = rate
+        if rate < 0:
+            out["mem_tte_h"] = (avail / 1048576) / -rate
+    disks = {}
+    for d in state.get("disks", []):
+        a_free = (anchor.get("disks") or {}).get(d["mount"])
+        if a_free is None:
+            continue
+        fill = (a_free - d["free_kb"]) / 1048576 / dt_h
+        entry = {"gb_h": fill}
+        if fill > 0:
+            entry["ttf_h"] = (d["free_kb"] / 1048576) / fill
+        disks[d["mount"]] = entry
+    if disks:
+        out["disks"] = disks
+    top, a_top = state.get("top"), anchor.get("top")
+    if (top and isinstance(a_top, dict) and top.get("name") == a_top.get("name")
+            and a_top.get("rss_kb") is not None):
+        out["top_gb_h"] = (top["rss_kb"] - a_top["rss_kb"]) / 1048576 / dt_h
+    return out
+
+
 def _state_dir(state_dir: str | None = None) -> Path:
     return Path(state_dir or os.environ.get("SOMA_STATE_DIR")
                 or os.environ.get("CLAUDE_KIT_STATE_DIR", str(Path.home() / ".claude" / "state")))
@@ -324,8 +392,9 @@ def _env_list(name: str, default: list) -> list:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
-def assess(state: dict, th: dict | None = None, events: dict | None = None) -> dict:
-    """Flag which conditions cross a threshold. {flags: set, mem_avail_pct, swap_mb, load_ratio, top_pct, hot, strained, events}."""
+def assess(state: dict, th: dict | None = None, events: dict | None = None,
+           trends: dict | None = None) -> dict:
+    """Flag which conditions cross a threshold. {flags: set, mem_avail_pct, swap_mb, load_ratio, top_pct, hot, strained, events, trends}."""
     th = th or thresholds()
     flags = set()
     mem = state.get("mem", {})
@@ -373,6 +442,18 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None) -> d
         flags.add("ECC")
     if events.get("md_degraded"):
         flags.add("RAID")
+    trends = trends or {}
+    tte = trends.get("mem_tte_h")
+    # DRAIN needs both an imminent time-to-empty and less than half the RAM
+    # left; a big one-off allocation on a mostly-free box is loading, not leaking.
+    if tte is not None and tte < th["mem_tte_h"] and mem_avail_pct < 50.0:
+        flags.add("DRAIN")
+    for entry in trends.get("disks", {}).values():
+        ttf = entry.get("ttf_h")
+        if ttf is not None and ttf < th["disk_ttf_h"]:
+            flags.add("FILL")
+    if th["top_growth_gbh"] and trends.get("top_gb_h", 0.0) >= th["top_growth_gbh"]:
+        flags.add("GROW")
     return {
         "flags": flags,
         "mem_avail_pct": mem_avail_pct,
@@ -382,6 +463,7 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None) -> d
         "hot": hot,
         "strained": strained,
         "events": events,
+        "trends": trends,
     }
 
 
@@ -392,8 +474,11 @@ def render(state: dict, a: dict) -> str:
     avail = mem.get("MemAvailable", 0)
     swap_used = mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)
     parts = []
+    trends = a.get("trends", {})
     if total:
         tag = "(LOW)" if "LOW_MEM" in a["flags"] else ""
+        if "DRAIN" in a["flags"]:
+            tag += f" ({trends['mem_gb_h']:+.1f}G/h, empty ~{trends['mem_tte_h']:.1f}h)(DRAIN)"
         parts.append(f"mem {human_kb(avail)}/{human_kb(total)} avail{tag}")
     if swap_used > 0:
         parts.append(f"swap {human_kb(swap_used)}")
@@ -402,11 +487,18 @@ def render(state: dict, a: dict) -> str:
     top = state.get("top")
     if top and total:
         tag = "(TOP)" if "TOP" in a["flags"] else ""
+        if "GROW" in a["flags"]:
+            tag += f" (+{trends['top_gb_h']:.1f}G/h)(GROW)"
         parts.append(f"top {top['name']} {human_kb(top['rss_kb'])}({a['top_pct']:.1f}%){tag}")
     worst = max(state.get("disks", []), key=lambda d: d["pct"], default=None)
     if worst:
         tag = "(HIGH)" if "DISK" in a["flags"] else ""
         parts.append(f"{worst['mount']} {worst['pct']:.0f}%{tag}")
+    if "FILL" in a["flags"]:
+        mount, entry = min(
+            ((m, e) for m, e in trends.get("disks", {}).items() if "ttf_h" in e),
+            key=lambda kv: kv[1]["ttf_h"])
+        parts.append(f"fill {mount} +{entry['gb_h']:.1f}G/h (full ~{entry['ttf_h']:.0f}h)(FILL)")
     load1 = state.get("load", (0.0,))[0]
     tag = "(HIGH)" if "LOAD" in a["flags"] else ""
     parts.append(f"load {load1:.1f}/{state.get('cores', 1)}{tag}")
@@ -442,16 +534,18 @@ def render(state: dict, a: dict) -> str:
 
 def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=None,
                   hwmon_root: str = "/sys/class/hwmon", sys_root: str = "/sys",
-                  state_dir: str | None = None) -> str | None:
+                  state_dir: str | None = None, now: float | None = None) -> str | None:
     """Top-level: gather, diff against the persisted baseline, assess, persist,
     return the line to print or None to stay silent."""
     if mode == "off":
         return None
+    now = now if now is not None else time.time()
     state = gather(proc_root, mounts, services, hwmon_root, sys_root)
     prev = load_state(state_dir)
     events = diff_events(state.get("counters", {}), prev.get("counters", {}))
-    a = assess(state, events=events)
-    save_state({"counters": state.get("counters", {})}, state_dir)
+    trends = compute_trends(state, prev.get("anchor"), now)
+    a = assess(state, events=events, trends=trends)
+    save_state(roll_state(prev, state, now), state_dir)
     if mode == "always" or a["flags"]:
         line = render(state, a)
         log_emission(line, a["flags"], state_dir)

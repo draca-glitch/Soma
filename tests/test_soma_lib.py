@@ -311,3 +311,90 @@ def test_line_for_mode_pressure_emits_on_oom_delta(tmp_path):
     line = _lfm("pressure", proc)
     assert line and "pain oom-kill 1" in line
     assert _lfm("pressure", proc) is None  # delta consumed, silent again
+
+
+def _anchor(ts=0.0, avail_kb=40000000, disks=None, top=None):
+    return {"ts": ts, "mem_avail_kb": avail_kb,
+            "disks": disks if disks is not None else {"/": 200000000},
+            "top": top}
+
+
+def test_compute_trends_mem_drain_and_tte():
+    state = _healthy_state(mem={"MemTotal": 64000000, "MemAvailable": 30000000,
+                                "SwapTotal": 0, "SwapFree": 0})
+    t = soma_lib.compute_trends(state, _anchor(ts=0.0, avail_kb=40000000), now=3600.0)
+    assert round(t["mem_gb_h"], 2) == round(-10000000 / 1048576, 2)  # ~-9.5G/h
+    assert round(t["mem_tte_h"], 1) == 3.0  # 30G left at ~9.5G/h
+
+
+def test_compute_trends_disk_fill_and_top_growth():
+    state = _healthy_state(
+        disks=[{"mount": "/", "pct": 50.0, "free_kb": 190000000}],
+        top={"name": "mnemos-mcp", "rss_kb": 11000000})
+    anchor = _anchor(ts=0.0, top={"name": "mnemos-mcp", "rss_kb": 9000000})
+    t = soma_lib.compute_trends(state, anchor, now=3600.0)
+    assert t["disks"]["/"]["gb_h"] > 9  # ~9.5G/h fill
+    assert t["disks"]["/"]["ttf_h"] < 20
+    assert round(t["top_gb_h"], 1) == round(2000000 / 1048576, 1)
+
+
+def test_compute_trends_guards():
+    state = _healthy_state()
+    assert soma_lib.compute_trends(state, None, now=100.0) == {}
+    assert soma_lib.compute_trends(state, _anchor(ts=95.0), now=100.0) == {}  # 5s, noise
+    anchor = _anchor(ts=0.0, top={"name": "other-proc", "rss_kb": 9000000})
+    state2 = _healthy_state(top={"name": "mnemos-mcp", "rss_kb": 11000000})
+    assert "top_gb_h" not in soma_lib.compute_trends(state2, anchor, now=3600.0)  # top changed hands
+
+
+def test_roll_state_anchor_window():
+    state = _healthy_state()
+    prev = {"counters": {}, "anchor": _anchor(ts=1000.0)}
+    kept = soma_lib.roll_state(prev, state, now=1300.0, anchor_s=600)
+    assert kept["anchor"]["ts"] == 1000.0  # young anchor kept
+    rolled = soma_lib.roll_state(prev, state, now=1700.0, anchor_s=600)
+    assert rolled["anchor"]["ts"] == 1700.0  # aged anchor replaced
+    future = soma_lib.roll_state({"anchor": _anchor(ts=9999.0)}, state, now=1700.0, anchor_s=600)
+    assert future["anchor"]["ts"] == 1700.0  # clock skew resets anchor
+
+
+def test_assess_drain_fill_grow_flags():
+    state = _healthy_state(mem={"MemTotal": 64000000, "MemAvailable": 20000000,
+                                "SwapTotal": 0, "SwapFree": 0})
+    trends = {"mem_gb_h": -12.0, "mem_tte_h": 1.5,
+              "disks": {"/": {"gb_h": 8.0, "ttf_h": 10.0}}, "top_gb_h": 0.7}
+    a = soma_lib.assess(state, trends=trends)
+    assert {"DRAIN", "FILL", "GROW"} <= a["flags"]
+
+
+def test_assess_drain_needs_below_half_ram():
+    state = _healthy_state()  # 36G of 64G available, above half
+    a = soma_lib.assess(state, trends={"mem_gb_h": -30.0, "mem_tte_h": 1.0})
+    assert "DRAIN" not in a["flags"]
+
+
+def test_render_trend_annotations():
+    state = _healthy_state(
+        mem={"MemTotal": 64000000, "MemAvailable": 20000000, "SwapTotal": 0, "SwapFree": 0},
+        disks=[{"mount": "/", "pct": 60.0, "free_kb": 100000000}],
+        top={"name": "mnemos-mcp", "rss_kb": 11000000})
+    trends = {"mem_gb_h": -12.0, "mem_tte_h": 1.5,
+              "disks": {"/": {"gb_h": 8.0, "ttf_h": 10.0}}, "top_gb_h": 0.7}
+    a = soma_lib.assess(state, trends=trends)
+    line = soma_lib.render(state, a)
+    assert "(-12.0G/h, empty ~1.5h)(DRAIN)" in line
+    assert "(+0.7G/h)(GROW)" in line
+    assert "fill / +8.0G/h (full ~10h)(FILL)" in line
+
+
+def test_line_for_mode_trend_integration(tmp_path):
+    proc = _fake_proc(tmp_path, avail=40000000)
+    assert _lfm("pressure", proc, now=0.0) is None  # baseline anchor
+    later = tmp_path / "later"
+    later.mkdir()
+    proc2 = _fake_proc(later, avail=10000000)  # 28G drained, 9G left
+    line = soma_lib.line_for_mode(
+        "pressure", proc_root=str(proc2), mounts=[], services=[],
+        hwmon_root=str(proc2 / "no-hwmon"), sys_root=str(proc2 / "no-sys"),
+        state_dir=str(proc / "state"), now=3600.0)
+    assert line and "(DRAIN)" in line

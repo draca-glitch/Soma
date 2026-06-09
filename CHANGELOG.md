@@ -8,6 +8,17 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: an emission-vs-behavior evaluator (replay `soma-log.jsonl` against transcripts) to measure whether body-state injection shifts decisions, the falsifiable test of whether the orienting mechanism generalizes off the time axis.
 
+## [0.4.0] - 2026-06-09
+
+The movement sense. Proprioception detects velocity, not just position: "85% used" is ambiguous, "full in ~6h" is actionable. Builds on the state file introduced in 0.3.0.
+
+### Added
+- **Trend rates against a rolling anchor.** `roll_state()` keeps a trend anchor in `soma-state.json`, refreshing it only once it ages past `SOMA_TREND_ANCHOR_S` (default 600s), so rates are measured over a stable window even when readings arrive seconds apart. `compute_trends()` derives GB/h rates: RAM drain (with hours-to-empty), per-mount fill (with hours-to-full), and top-process RSS growth (only while the same process holds the top spot).
+- **Flags**: `DRAIN` (RAM empties within `SOMA_MEM_TTE_H`, default 2h, and is already below half, so a big one-off allocation on a mostly-free box does not alarm), `FILL` (mount fills within `SOMA_DISK_TTF_H`, default 24h), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`, default 0.5 GB/h).
+- **Rendering**: rate annotations appear only on flagged segments, e.g. `mem 9.5G/61G avail (-12.0G/h, empty ~1.5h)(DRAIN)`, `top mnemos-mcp 11G(17%) (+0.7G/h)(GROW)`, `fill / +8.0G/h (full ~10h)(FILL)`. Healthy lines look exactly as before; the quiet aesthetic survives.
+- Temperature slope was considered and rejected: thermal time constants are seconds, so a minutes-scale slope is noise. Temps stay level-gated.
+- 8 new tests (39 total).
+
 ## [0.3.0] - 2026-06-09
 
 Two new senses, plus the persistence they require. Proprioception is not just position (levels); this release adds strain (how hard is the body working to stand still) and pain (what got damaged since you last checked).
