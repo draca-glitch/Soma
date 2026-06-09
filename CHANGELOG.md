@@ -8,6 +8,13 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: an emission-vs-behavior evaluator (replay `soma-log.jsonl` against transcripts) to measure whether body-state injection shifts decisions, the falsifiable test of whether the orienting mechanism generalizes off the time axis.
 
+## [0.2.0] - 2026-06-09
+
+### Added
+- **Temperature sensing.** `read_temps()` reads sysfs hwmon and reports the hottest sensor per class: `cpu` (k10temp, coretemp, zenpower, cpu_thermal), `disk` (nvme, drivetemp), `gpu` (amdgpu, radeon, i915, nouveau). Unknown chips (VRM, chipset, ACPI zones) are ignored. The rendered line gains a `temp cpu 42 disk 30 gpu 39°C` segment when sensors exist; a class crossing its ceiling is tagged `(HOT)` and trips pressure-mode emission. New thresholds: `SOMA_TEMP_CPU` (85), `SOMA_TEMP_DISK` (70), `SOMA_TEMP_GPU` (90), each `0` to disable. DIMM temperatures are not read: the spd5118 driver that exposes DDR5 SPD-hub sensors only landed in kernel 6.10+, and jc42 coverage is rare on servers; the class can be added when hardware exposes it.
+- `gather()` and `line_for_mode()` take an `hwmon_root` parameter (default `/sys/class/hwmon`) so tests and replayers can point at a fake tree.
+- 7 new tests (22 total).
+
 ## [0.1.1] - 2026-06-03
 
 ### Fixed

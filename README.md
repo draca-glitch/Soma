@@ -28,6 +28,7 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Top consumer**: the single largest-RSS process, surfaced when it holds a notable share of RAM even if total memory is fine (the common case: one process quietly dominating a healthy box).
 - **Disk**: percent-used on a small mount watchlist.
 - **Load**: 1-minute load average against core count.
+- **Temperature**: hottest sensor per class (CPU, disk, GPU) from sysfs hwmon, when the kernel exposes them. The body's fever check: a `(HOT)` tag on the class that crossed its ceiling.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
 ## Design principles
@@ -66,6 +67,9 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_DISK_PCT` | `85` | flag when any watched mount exceeds this percent used |
 | `SOMA_LOAD_RATIO` | `1.0` | flag when 1-min load / cores exceeds this |
 | `SOMA_TOP_RSS_PCT` | `25` | flag the top process when its RSS exceeds this percent of total RAM; `0` disables |
+| `SOMA_TEMP_CPU` | `85` | degC ceiling for the CPU sensor class (k10temp, coretemp, ...); `0` disables |
+| `SOMA_TEMP_DISK` | `70` | degC ceiling for the disk sensor class (nvme, drivetemp); `0` disables |
+| `SOMA_TEMP_GPU` | `90` | degC ceiling for the GPU sensor class (amdgpu, i915, ...); `0` disables |
 | `SOMA_MOUNTS` | `/,/root/work` | comma-separated mounts to check (duplicate filesystems are deduped) |
 | `SOMA_SERVICES` | *(empty)* | comma-separated services to probe; empty means no `systemctl` call |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |

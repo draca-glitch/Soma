@@ -52,6 +52,9 @@ def thresholds() -> dict:
         "disk_pct": _env_float("SOMA_DISK_PCT", 85.0),             # mount-full ceiling
         "load_ratio": _env_float("SOMA_LOAD_RATIO", 1.0),          # load1 / cores ceiling
         "top_rss_pct": _env_float("SOMA_TOP_RSS_PCT", 25.0),       # single-process RAM share worth noting; 0 disables
+        "temp_cpu": _env_float("SOMA_TEMP_CPU", 85.0),             # degC ceilings per sensor class; 0 disables a class
+        "temp_disk": _env_float("SOMA_TEMP_DISK", 70.0),
+        "temp_gpu": _env_float("SOMA_TEMP_GPU", 90.0),
     }
 
 
@@ -124,6 +127,44 @@ def disk_usage(paths: list) -> list:
     return out
 
 
+# hwmon chip name -> sensor class. Only classes with a threshold are read;
+# anything else (VRM, chipset, ACPI zones) stays out of the line.
+CHIP_CLASSES = {
+    "k10temp": "cpu", "coretemp": "cpu", "zenpower": "cpu", "cpu_thermal": "cpu",
+    "nvme": "disk", "drivetemp": "disk",
+    "amdgpu": "gpu", "radeon": "gpu", "i915": "gpu", "nouveau": "gpu",
+}
+
+
+def read_temps(hwmon_root: str = "/sys/class/hwmon") -> dict:
+    """Hottest reading per sensor class from sysfs hwmon. {cpu|disk|gpu: degC}.
+
+    max() within a class so multi-device classes (two NVMe drives, several
+    CCDs) report their worst sensor. Unknown chips are ignored; missing or
+    malformed sysfs entries are skipped, never fatal.
+    """
+    out = {}
+    try:
+        chips = list(Path(hwmon_root).iterdir())
+    except OSError:
+        return out
+    for chip in chips:
+        try:
+            cls = CHIP_CLASSES.get((chip / "name").read_text().strip())
+        except OSError:
+            continue
+        if not cls:
+            continue
+        for probe in chip.glob("temp*_input"):
+            try:
+                deg = int(probe.read_text().strip()) / 1000
+            except (OSError, ValueError):
+                continue
+            if cls not in out or deg > out[cls]:
+                out[cls] = deg
+    return out
+
+
 def service_states(names: list) -> list:
     """systemctl is-active for a small watchlist. [(name, state)]. Empty list = no probe."""
     if not names:
@@ -147,7 +188,8 @@ def human_kb(kb: float) -> str:
     return f"{g:.0f}G" if g >= 100 else f"{g:.1f}G"
 
 
-def gather(proc_root: str = "/proc", mounts: list | None = None, services: list | None = None) -> dict:
+def gather(proc_root: str = "/proc", mounts: list | None = None, services: list | None = None,
+           hwmon_root: str = "/sys/class/hwmon") -> dict:
     """Read the body's current state. Never raises; missing pieces are absent keys."""
     mounts = mounts if mounts is not None else _env_list("SOMA_MOUNTS", ["/", "/root/work"])
     services = services if services is not None else _env_list("SOMA_SERVICES", [])
@@ -163,6 +205,7 @@ def gather(proc_root: str = "/proc", mounts: list | None = None, services: list 
     state["top"] = top_rss(proc_root)
     state["disks"] = disk_usage(mounts)
     state["services"] = service_states(services)
+    state["temps"] = read_temps(hwmon_root)
     return state
 
 
@@ -203,12 +246,20 @@ def assess(state: dict, th: dict | None = None) -> dict:
     for _, svc_state in state.get("services", []):
         if svc_state not in ("active", "unknown"):
             flags.add("SVC")
+    hot = set()
+    for cls, deg in state.get("temps", {}).items():
+        ceiling = th.get(f"temp_{cls}", 0)
+        if ceiling and deg >= ceiling:
+            hot.add(cls)
+    if hot:
+        flags.add("HOT")
     return {
         "flags": flags,
         "mem_avail_pct": mem_avail_pct,
         "swap_mb": swap_mb,
         "load_ratio": load_ratio,
         "top_pct": top_pct,
+        "hot": hot,
     }
 
 
@@ -237,17 +288,26 @@ def render(state: dict, a: dict) -> str:
     load1 = state.get("load", (0.0,))[0]
     tag = "(HIGH)" if "LOAD" in a["flags"] else ""
     parts.append(f"load {load1:.1f}/{state.get('cores', 1)}{tag}")
+    temps = state.get("temps", {})
+    if temps:
+        hot = a.get("hot", set())
+        seg = " ".join(
+            f"{cls} {deg:.0f}" + ("(HOT)" if cls in hot else "")
+            for cls, deg in sorted(temps.items())
+        )
+        parts.append(f"temp {seg}°C")
     down = [n for n, s in state.get("services", []) if s not in ("active", "unknown")]
     if down:
         parts.append("svc-down: " + ",".join(down))
     return "[system-state] " + " · ".join(parts)
 
 
-def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=None) -> str | None:
+def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=None,
+                  hwmon_root: str = "/sys/class/hwmon") -> str | None:
     """Top-level: gather, assess, return the line to print or None to stay silent."""
     if mode == "off":
         return None
-    state = gather(proc_root, mounts, services)
+    state = gather(proc_root, mounts, services, hwmon_root)
     a = assess(state)
     if mode == "always" or a["flags"]:
         return render(state, a)

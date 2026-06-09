@@ -137,16 +137,87 @@ def test_line_for_mode_off():
 
 def test_line_for_mode_pressure_silent_on_healthy(tmp_path):
     proc = _fake_proc(tmp_path)
-    assert soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[]) is None
+    assert soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[],
+                                  hwmon_root=str(proc / "no-hwmon")) is None
 
 
 def test_line_for_mode_always_emits_on_healthy(tmp_path):
     proc = _fake_proc(tmp_path)
-    line = soma_lib.line_for_mode("always", proc_root=str(proc), mounts=[], services=[])
+    line = soma_lib.line_for_mode("always", proc_root=str(proc), mounts=[], services=[],
+                                  hwmon_root=str(proc / "no-hwmon"))
     assert line and line.startswith("[system-state]")
 
 
 def test_line_for_mode_pressure_emits_on_swap(tmp_path):
     proc = _fake_proc(tmp_path, swap_total=2000000, swap_free=0)  # ~1.9G swap used > 256M
-    line = soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[])
+    line = soma_lib.line_for_mode("pressure", proc_root=str(proc), mounts=[], services=[],
+                                  hwmon_root=str(proc / "no-hwmon"))
     assert line and "swap" in line
+
+
+def _fake_hwmon(tmp_path, chips):
+    root = tmp_path / "hwmon"
+    root.mkdir(exist_ok=True)
+    for i, (name, temps) in enumerate(chips):
+        d = root / f"hwmon{i}"
+        d.mkdir()
+        (d / "name").write_text(name + "\n")
+        for j, milli in enumerate(temps, start=1):
+            (d / f"temp{j}_input").write_text(f"{milli}\n")
+    return str(root)
+
+
+def test_read_temps_classifies_and_takes_max(tmp_path):
+    root = _fake_hwmon(tmp_path, [
+        ("nvme", [27000, 26000]),
+        ("nvme", [30000]),
+        ("k10temp", [42000]),
+        ("amdgpu", [39000]),
+        ("acpitz", [55000]),  # unknown chip class, ignored
+    ])
+    assert soma_lib.read_temps(root) == {"disk": 30.0, "cpu": 42.0, "gpu": 39.0}
+
+
+def test_read_temps_missing_root(tmp_path):
+    assert soma_lib.read_temps(str(tmp_path / "absent")) == {}
+
+
+def test_read_temps_malformed_skipped(tmp_path):
+    root = _fake_hwmon(tmp_path, [("k10temp", [])])
+    (Path(root) / "hwmon0" / "temp1_input").write_text("garbage\n")
+    assert soma_lib.read_temps(root) == {}
+
+
+def _healthy_state(**overrides):
+    state = {
+        "cores": 16,
+        "mem": {"MemTotal": 64000000, "MemAvailable": 36000000, "SwapTotal": 0, "SwapFree": 0},
+        "load": (0.1, 0, 0), "top": None, "disks": [], "services": [], "temps": {},
+    }
+    state.update(overrides)
+    return state
+
+
+def test_assess_flags_hot():
+    a = soma_lib.assess(_healthy_state(temps={"cpu": 91.0, "disk": 35.0}))
+    assert "HOT" in a["flags"]
+    assert a["hot"] == {"cpu"}
+
+
+def test_assess_temp_class_zero_disables(monkeypatch):
+    monkeypatch.setenv("SOMA_TEMP_CPU", "0")
+    a = soma_lib.assess(_healthy_state(temps={"cpu": 99.0}))
+    assert "HOT" not in a["flags"]
+
+
+def test_render_temp_segment_and_hot_tag():
+    state = _healthy_state(temps={"cpu": 91.0, "disk": 30.0, "gpu": 39.0})
+    a = soma_lib.assess(state)
+    line = soma_lib.render(state, a)
+    assert "temp cpu 91(HOT) disk 30 gpu 39\u00b0C" in line
+
+
+def test_render_no_temp_segment_when_absent():
+    state = _healthy_state()
+    a = soma_lib.assess(state)
+    assert "temp" not in soma_lib.render(state, a)
