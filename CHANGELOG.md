@@ -6,7 +6,15 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 ## [Unreleased]
 
-Next probable: an emission-vs-behavior evaluator (replay `soma-log.jsonl` against transcripts) to measure whether body-state injection shifts decisions, the falsifiable test of whether the orienting mechanism generalizes off the time axis.
+Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
+
+## [0.7.0] - 2026-06-10
+
+The falsifiability layer. Soma now measures whether anyone listens to it.
+
+### Added
+- **`analyze-emission-behavior.py`**: joins `soma-log.jsonl` against Claude Code session transcripts and reports, per flag class, whether the agent acknowledged the condition in its response text, acted on it (flag-specific investigation commands), and at what latency (tool calls before first reaction). Healthy always-mode emissions (empty flag set) form the control population: a line of identical shape carrying no notable condition. Flagged-vs-control ack/act rates are the behavior-shift signal, the falsifiable test of whether orienting injection generalizes off the time axis (the sibling Kairos project documents the temporal version). The response window is configurable (default 600s) and closes at the next user turn, so credit never leaks across turns. Privacy: reads transcripts in place, emits aggregate counts only. 6 tests (55 total).
+- First live run on the 24-emission corpus already separates populations: GROW acknowledged at 50%, TOP at 20%, healthy controls at 0%.
 
 ## [0.6.0] - 2026-06-10
 

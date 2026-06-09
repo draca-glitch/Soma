@@ -41,6 +41,10 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - `soma-pulse.py` (PostToolUse): samples mid-turn, while the agent is acting, which is exactly when the agent itself is loading the box. Emits only on a flag **transition** (something appeared, or a chronic condition cleared), so a long healthy turn costs zero lines and a persisting condition is not repeated every tool call. An acute pain flag clearing is just the delta baseline advancing and does not count as a recovery. Gated by `SOMA_PULSE`.
 
 Both share `soma-state.json` (counter baselines, trend anchor, last flag set), so a condition announced at prompt time is not re-announced by the first pulse.
+
+## Measuring whether it works
+
+`analyze-emission-behavior.py` replays the emission log against session transcripts and reports, per flag class, how often the agent acknowledged the condition, acted on it, and how quickly, with healthy always-mode emissions as the control population. A flag class whose ack/act rates match the healthy control is a sense nobody uses; one that separates is measured behavior shift. This is Soma's falsifiability substrate: the project's premise (orienting injection generalizes beyond the time axis) is tested against its own production log, not asserted.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
 ## Design principles
