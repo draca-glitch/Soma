@@ -8,6 +8,16 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: an emission-vs-behavior evaluator (replay `soma-log.jsonl` against transcripts) to measure whether body-state injection shifts decisions, the falsifiable test of whether the orienting mechanism generalizes off the time axis.
 
+## [0.6.0] - 2026-06-10
+
+The body boundary, and limbs that stop answering.
+
+### Added
+- **Self vs world.** `self_tree_rss()` walks from the hook to the nearest ancestor whose comm matches `SOMA_SELF_COMM` (default `claude,node`) and sums RSS over that ancestor's entire subtree: the harness, its MCP servers (the agent's organs), and any running tool subprocesses (the agent's own effort). Rendered as `self claude[14] 12.1G(19.5%)`; flags `SELF` past `SOMA_SELF_RSS_PCT` (default 40, `0` disables). Falls back to the hook's immediate parent when no harness ancestor is found. "I am heavy" and "the world is heavy" are different facts and now distinguishable.
+- **Numb-limb watchdog.** `disk_usage()` now probes every mount in parallel watchdog threads under one shared deadline (`SOMA_MOUNT_TIMEOUT_MS`, default 150). A probe that misses the deadline reports the mount in `numb:` with flag `NUMB` instead of blocking; previously a hung network mount (VPN drop under CIFS/NFS) would hang the hook, and with it the prompt, for the hook timeout. Soma's own worst failure mode is now its most valuable mount signal. Returns `{mounts, numb}` instead of a bare list (pre-1.0 breaking change).
+- `NUMB` and `SELF` are chronic flags: the pulse hook announces them once on appearance and once on recovery.
+- 7 new tests (49 total).
+
 ## [0.5.0] - 2026-06-09
 
 Sampling while moving. Until now Soma only fired when the human spoke; the body changes most while the AGENT acts (builds, benches, parallel subagents), and that entire window was blind.

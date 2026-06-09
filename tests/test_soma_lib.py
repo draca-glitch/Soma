@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -443,3 +444,83 @@ def test_pulse_off(tmp_path, monkeypatch):
     monkeypatch.setenv("SOMA_PULSE", "off")
     proc = _fake_proc(tmp_path)
     assert _pulse(proc, now=0.0) is None
+
+
+def test_disk_usage_normal(tmp_path):
+    du = soma_lib.disk_usage([str(tmp_path)])
+    assert du["numb"] == []
+    assert len(du["mounts"]) == 1
+    assert du["mounts"][0]["mount"] == str(tmp_path)
+    assert 0.0 <= du["mounts"][0]["pct"] <= 100.0
+
+
+def test_disk_usage_numb_limb(tmp_path, monkeypatch):
+    import time as _time
+    real_statvfs = os.statvfs
+
+    def hanging_statvfs(path):
+        if path == "/mnt/dead":
+            _time.sleep(2.0)
+        return real_statvfs(path)
+
+    monkeypatch.setattr(soma_lib.os, "statvfs", hanging_statvfs)
+    du = soma_lib.disk_usage([str(tmp_path), "/mnt/dead"], timeout_s=0.1)
+    assert du["numb"] == ["/mnt/dead"]
+    assert len(du["mounts"]) == 1  # the live mount still reports
+
+
+def _fake_proc_tree(tmp_path, procs):
+    for pid, comm, ppid, pages in procs:
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} 0 0 0 0 0 0\n")
+        (d / "statm").write_text(f"1000 {pages} 10 1 0 100 0\n")
+    return str(tmp_path)
+
+
+def test_self_tree_rss_finds_harness_ancestor(tmp_path):
+    root = _fake_proc_tree(tmp_path, [
+        (50, "sshd", 1, 10),
+        (100, "claude", 50, 500),
+        (200, "mnemos-mcp", 100, 900),
+        (300, "python3", 200, 30),
+        (400, "chromium", 1, 4000),  # the world, not self
+    ])
+    own = soma_lib.self_tree_rss(root, self_pid=300)
+    assert own["name"] == "claude"
+    assert own["procs"] == 3
+    assert own["rss_kb"] == int((500 + 900 + 30) * soma_lib.PAGE_KB)
+
+
+def test_self_tree_rss_fallback_to_parent(tmp_path):
+    root = _fake_proc_tree(tmp_path, [
+        (200, "bash", 1, 100),
+        (300, "python3", 200, 30),
+    ])
+    own = soma_lib.self_tree_rss(root, self_pid=300)
+    assert own["name"] == "bash"
+    assert own["procs"] == 2
+
+
+def test_self_tree_rss_unknown_pid(tmp_path):
+    _fake_proc_tree(tmp_path, [(200, "bash", 1, 100)])
+    assert soma_lib.self_tree_rss(str(tmp_path), self_pid=9999) is None
+
+
+def test_assess_self_and_numb_flags():
+    state = _healthy_state(
+        self={"name": "claude", "rss_kb": 32000000, "procs": 4},  # half of 64G
+        numb=["/mnt/nas"])
+    a = soma_lib.assess(state)
+    assert {"SELF", "NUMB"} <= a["flags"]
+    assert a["self_pct"] == 50.0
+
+
+def test_render_self_and_numb_segments():
+    state = _healthy_state(
+        self={"name": "claude", "rss_kb": 32000000, "procs": 4},
+        numb=["/mnt/nas"])
+    a = soma_lib.assess(state)
+    line = soma_lib.render(state, a)
+    assert "self claude[4] 30.5G(50.0%)(SELF)" in line
+    assert "numb: /mnt/nas" in line

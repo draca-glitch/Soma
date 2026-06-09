@@ -25,6 +25,7 @@ Design rules (mirrors the sibling Kairos):
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -60,6 +61,7 @@ def thresholds() -> dict:
         "mem_tte_h": _env_float("SOMA_MEM_TTE_H", 2.0),            # flag drain when RAM empties within this many hours
         "disk_ttf_h": _env_float("SOMA_DISK_TTF_H", 24.0),         # flag fill when a mount fills within this many hours
         "top_growth_gbh": _env_float("SOMA_TOP_GROWTH_GBH", 0.5),  # flag top-process growth above this GB/h; 0 disables
+        "self_rss_pct": _env_float("SOMA_SELF_RSS_PCT", 40.0),     # own-process-tree RAM share ceiling; 0 disables
     }
 
 
@@ -113,14 +115,40 @@ def top_rss(proc_root: str = "/proc") -> dict | None:
     return best
 
 
-def disk_usage(paths: list) -> list:
-    """statvfs each path; dedupe identical filesystems. [{mount, pct, free_kb}]."""
-    seen = set()
-    out = []
-    for p in paths:
+def disk_usage(paths: list, timeout_s: float | None = None) -> dict:
+    """statvfs each path under a shared deadline. {mounts: [{mount, pct, free_kb}], numb: [path]}.
+
+    A network mount whose transport died (VPN drop under CIFS/NFS) blocks
+    statvfs indefinitely, which would block the hook and with it the prompt.
+    Probes run in parallel watchdog threads; a probe that misses the
+    deadline reports the mount as numb, the body's strongest mount signal
+    (an unfeeling limb), instead of hanging. Abandoned probe threads are
+    daemons and die with the process. Identical filesystems are deduped.
+    """
+    if timeout_s is None:
+        timeout_s = _env_float("SOMA_MOUNT_TIMEOUT_MS", 150.0) / 1000.0
+    results = {}
+
+    def probe(path):
         try:
-            st = os.statvfs(p)
+            results[path] = os.statvfs(path)
         except OSError:
+            results[path] = None
+
+    threads = {}
+    for p in paths:
+        t = threading.Thread(target=probe, args=(p,), daemon=True)
+        t.start()
+        threads[p] = t
+    deadline = time.monotonic() + timeout_s
+    mounts, numb, seen = [], [], set()
+    for p in paths:
+        threads[p].join(max(0.0, deadline - time.monotonic()))
+        if threads[p].is_alive():
+            numb.append(p)
+            continue
+        st = results.get(p)
+        if st is None:
             continue
         sig = (st.f_blocks, st.f_bavail)
         if st.f_blocks == 0 or sig in seen:
@@ -128,8 +156,71 @@ def disk_usage(paths: list) -> list:
         seen.add(sig)
         used = st.f_blocks - st.f_bfree
         pct = used / (used + st.f_bavail) * 100 if (used + st.f_bavail) else 0.0
-        out.append({"mount": p, "pct": pct, "free_kb": st.f_bavail * st.f_frsize // 1024})
-    return out
+        mounts.append({"mount": p, "pct": pct, "free_kb": st.f_bavail * st.f_frsize // 1024})
+    return {"mounts": mounts, "numb": numb}
+
+
+def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict | None:
+    """RSS of the agent's own process tree. {name, rss_kb, procs} or None.
+
+    The body boundary: 'I am heavy' is a different fact from 'the world is
+    heavy'. Self is the nearest ancestor of this hook whose comm matches
+    SOMA_SELF_COMM (default claude,node: the harness that spawned the hook),
+    plus every descendant of that ancestor, which covers the MCP servers it
+    spawned (the agent's organs) and any tool subprocesses currently running
+    (the agent's own effort). Falls back to the hook's immediate parent when
+    no ancestor matches; None when the chain cannot be read at all.
+    """
+    self_names = set(_env_list("SOMA_SELF_COMM", ["claude", "node"]))
+    self_pid = self_pid if self_pid is not None else os.getpid()
+    root = Path(proc_root)
+    ppid_of, comm_of, rss_of, kids_of = {}, {}, {}, {}
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat = (entry / "stat").read_text()
+            resident_pages = int((entry / "statm").read_text().split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        try:
+            comm = stat[stat.index("(") + 1:stat.rindex(")")]
+            ppid = int(stat[stat.rindex(")") + 1:].split()[1])
+        except (ValueError, IndexError):
+            continue
+        ppid_of[pid] = ppid
+        comm_of[pid] = comm
+        rss_of[pid] = int(resident_pages * PAGE_KB)
+        kids_of.setdefault(ppid, []).append(pid)
+    if self_pid not in ppid_of:
+        return None
+    anchor, walked = None, set()
+    pid = self_pid
+    while pid in ppid_of and pid not in walked and pid > 1:
+        walked.add(pid)
+        if comm_of.get(pid) in self_names:
+            anchor = pid
+            break
+        pid = ppid_of[pid]
+    if anchor is None:
+        anchor = ppid_of.get(self_pid, self_pid)
+        if anchor not in ppid_of:
+            anchor = self_pid
+    total, count, queue, visited = 0, 0, [anchor], set()
+    while queue:
+        pid = queue.pop()
+        if pid in visited:
+            continue
+        visited.add(pid)
+        total += rss_of.get(pid, 0)
+        count += 1
+        queue.extend(kids_of.get(pid, []))
+    return {"name": comm_of.get(anchor, f"pid{anchor}"), "rss_kb": total, "procs": count}
 
 
 def read_psi(proc_root: str = "/proc") -> dict:
@@ -377,7 +468,10 @@ def gather(proc_root: str = "/proc", mounts: list | None = None, services: list 
     except OSError:
         state["load"] = (0.0, 0.0, 0.0)
     state["top"] = top_rss(proc_root)
-    state["disks"] = disk_usage(mounts)
+    du = disk_usage(mounts)
+    state["disks"] = du["mounts"]
+    state["numb"] = du["numb"]
+    state["self"] = self_tree_rss(proc_root)
     state["services"] = service_states(services)
     state["temps"] = read_temps(hwmon_root)
     state["psi"] = read_psi(proc_root)
@@ -408,9 +502,15 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None,
     load_ratio = load1 / cores if cores else 0.0
     top = state.get("top")
     top_pct = (top["rss_kb"] / total * 100) if (top and total) else 0.0
+    own = state.get("self")
+    self_pct = (own["rss_kb"] / total * 100) if (own and total) else 0.0
 
     if total and mem_avail_pct < th["mem_avail_pct"]:
         flags.add("LOW_MEM")
+    if th["self_rss_pct"] and self_pct > th["self_rss_pct"]:
+        flags.add("SELF")
+    if state.get("numb"):
+        flags.add("NUMB")
     if swap_mb > th["swap_mb"]:
         flags.add("SWAP")
     if load_ratio > th["load_ratio"]:
@@ -460,6 +560,7 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None,
         "swap_mb": swap_mb,
         "load_ratio": load_ratio,
         "top_pct": top_pct,
+        "self_pct": self_pct,
         "hot": hot,
         "strained": strained,
         "events": events,
@@ -490,6 +591,10 @@ def render(state: dict, a: dict) -> str:
         if "GROW" in a["flags"]:
             tag += f" (+{trends['top_gb_h']:.1f}G/h)(GROW)"
         parts.append(f"top {top['name']} {human_kb(top['rss_kb'])}({a['top_pct']:.1f}%){tag}")
+    own = state.get("self")
+    if own and total:
+        tag = "(SELF)" if "SELF" in a["flags"] else ""
+        parts.append(f"self {own['name']}[{own['procs']}] {human_kb(own['rss_kb'])}({a['self_pct']:.1f}%){tag}")
     worst = max(state.get("disks", []), key=lambda d: d["pct"], default=None)
     if worst:
         tag = "(HIGH)" if "DISK" in a["flags"] else ""
@@ -499,6 +604,8 @@ def render(state: dict, a: dict) -> str:
             ((m, e) for m, e in trends.get("disks", {}).items() if "ttf_h" in e),
             key=lambda kv: kv[1]["ttf_h"])
         parts.append(f"fill {mount} +{entry['gb_h']:.1f}G/h (full ~{entry['ttf_h']:.0f}h)(FILL)")
+    if state.get("numb"):
+        parts.append("numb: " + ",".join(state["numb"]))
     load1 = state.get("load", (0.0,))[0]
     tag = "(HIGH)" if "LOAD" in a["flags"] else ""
     parts.append(f"load {load1:.1f}/{state.get('cores', 1)}{tag}")
