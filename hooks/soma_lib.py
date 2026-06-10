@@ -57,6 +57,10 @@ def thresholds() -> dict:
         "temp_cpu": _env_float("SOMA_TEMP_CPU", 85.0),             # degC ceilings per sensor class; 0 disables a class
         "temp_disk": _env_float("SOMA_TEMP_DISK", 70.0),
         "temp_gpu": _env_float("SOMA_TEMP_GPU", 90.0),
+        "temp_ram": _env_float("SOMA_TEMP_RAM", 80.0),             # JEDEC normal range tops at 85
+        "temp_board": _env_float("SOMA_TEMP_BOARD", 90.0),         # PCH/chipset zones; Intel limits sit near 100
+        "temp_wifi": _env_float("SOMA_TEMP_WIFI", 80.0),           # iwlwifi self-throttles in the low 80s
+        "temp_acpi": _env_float("SOMA_TEMP_ACPI", 90.0),           # catch-all ACPI thermal zone
         "psi_pct": _env_float("SOMA_PSI_PCT", 25.0),               # PSI some/avg10 stall-share ceiling; 0 disables
         "mem_tte_h": _env_float("SOMA_MEM_TTE_H", 2.0),            # flag drain when RAM empties within this many hours
         "disk_ttf_h": _env_float("SOMA_DISK_TTF_H", 24.0),         # flag fill when a mount fills within this many hours
@@ -419,20 +423,42 @@ def save_state(doc: dict, state_dir: str | None = None) -> None:
 
 
 # hwmon chip name -> sensor class. Only classes with a threshold are read;
-# anything else (VRM, chipset, ACPI zones) stays out of the line.
+# anything unmatched (VRMs, embedded controllers) stays out of the line.
 CHIP_CLASSES = {
     "k10temp": "cpu", "coretemp": "cpu", "zenpower": "cpu", "cpu_thermal": "cpu",
     "nvme": "disk", "drivetemp": "disk",
     "amdgpu": "gpu", "radeon": "gpu", "i915": "gpu", "nouveau": "gpu",
+    "jc42": "ram", "spd5118": "ram",
+    "acpitz": "acpi",
 }
+
+# Family- or instance-suffixed chip names matched by prefix
+# (pch_cannonlake, pch_skylake, iwlwifi_1, ...).
+CHIP_PREFIXES = (
+    ("pch_", "board"),
+    ("iwlwifi", "wifi"),
+)
+
+
+def _chip_class(name: str):
+    cls = CHIP_CLASSES.get(name)
+    if cls:
+        return cls
+    for prefix, pcls in CHIP_PREFIXES:
+        if name.startswith(prefix):
+            return pcls
+    return None
 
 
 def read_temps(hwmon_root: str = "/sys/class/hwmon") -> dict:
-    """Hottest reading per sensor class from sysfs hwmon. {cpu|disk|gpu: degC}.
+    """Hottest reading per sensor class from sysfs hwmon.
+    {cpu|disk|gpu|ram|board|wifi|acpi: degC}.
 
     max() within a class so multi-device classes (two NVMe drives, several
-    CCDs) report their worst sensor. Unknown chips are ignored; missing or
-    malformed sysfs entries are skipped, never fatal.
+    CCDs, paired DIMMs) report their worst sensor. Unknown chips are ignored;
+    missing or malformed sysfs entries are skipped, never fatal. Readings
+    outside -40..150 are dropped: ACPI zones publish placeholder sensors
+    near absolute zero (-263) for trip points the firmware never wired up.
     """
     out = {}
     try:
@@ -441,7 +467,7 @@ def read_temps(hwmon_root: str = "/sys/class/hwmon") -> dict:
         return out
     for chip in chips:
         try:
-            cls = CHIP_CLASSES.get((chip / "name").read_text().strip())
+            cls = _chip_class((chip / "name").read_text().strip())
         except OSError:
             continue
         if not cls:
@@ -450,6 +476,8 @@ def read_temps(hwmon_root: str = "/sys/class/hwmon") -> dict:
             try:
                 deg = int(probe.read_text().strip()) / 1000
             except (OSError, ValueError):
+                continue
+            if deg < -40 or deg > 150:
                 continue
             if cls not in out or deg > out[cls]:
                 out[cls] = deg

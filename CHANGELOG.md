@@ -8,6 +8,16 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+## [0.9.0] - 2026-06-11
+
+Full-body thermoception: every hwmon chip a small machine actually carries.
+
+### Added
+- **Four new temperature classes**: `ram` (jc42, spd5118 DIMM sensors), `board` (`pch_*` chipset zones), `wifi` (`iwlwifi*`), `acpi` (acpitz catch-all zone), with ceilings `SOMA_TEMP_RAM` (80), `SOMA_TEMP_BOARD` (90), `SOMA_TEMP_WIFI` (80), `SOMA_TEMP_ACPI` (90); `0` disables a class as before. Flag and rendering logic were already class-generic, so the line grows new segments with no other changes. Motivating box: a NUC whose warmest parts (PCH 52°C, SO-DIMMs 49°C) were exactly the ones Soma could not feel.
+- **Prefix matching** for family- or instance-suffixed chip names (`pch_cannonlake`, `iwlwifi_1`) via `CHIP_PREFIXES`, alongside the exact-name `CHIP_CLASSES` map.
+- **Bogus-reading filter**: temperatures outside -40..150°C are dropped; ACPI zones publish placeholder sensors near absolute zero (-263°C) for trip points the firmware never wired up.
+- 1 new test (62 total).
+
 ## [0.8.0] - 2026-06-10
 
 The shared-apartment release: what a guest can and cannot feel.

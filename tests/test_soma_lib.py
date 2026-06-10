@@ -176,9 +176,22 @@ def test_read_temps_classifies_and_takes_max(tmp_path):
         ("nvme", [30000]),
         ("k10temp", [42000]),
         ("amdgpu", [39000]),
-        ("acpitz", [55000]),  # unknown chip class, ignored
+        ("ucsi_source_psy_1", [55000]),  # unknown chip class, ignored
     ])
     assert soma_lib.read_temps(root) == {"disk": 30.0, "cpu": 42.0, "gpu": 39.0}
+
+
+def test_read_temps_extended_classes_prefixes_and_bogus_filter(tmp_path):
+    root = _fake_hwmon(tmp_path, [
+        ("jc42", [47000]),
+        ("jc42", [49000]),               # second DIMM, hotter, wins the class
+        ("pch_cannonlake", [52000]),     # prefix match -> board
+        ("iwlwifi_1", [44000]),          # instance-suffixed prefix match -> wifi
+        ("acpitz", [-263200, 27000]),    # placeholder near absolute zero dropped
+    ])
+    assert soma_lib.read_temps(root) == {
+        "ram": 49.0, "board": 52.0, "wifi": 44.0, "acpi": 27.0,
+    }
 
 
 def test_read_temps_missing_root(tmp_path):
