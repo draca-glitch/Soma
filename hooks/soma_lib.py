@@ -342,7 +342,7 @@ def roll_state(prev: dict, state: dict, now: float, anchor_s: int | None = None)
     """Next persisted state doc. Counters refresh every reading; the trend
     anchor only when it has aged past anchor_s, so rates are measured over a
     stable window even when readings come seconds apart."""
-    anchor_s = anchor_s if anchor_s is not None else _env_int("SOMA_TREND_ANCHOR_S", 600)
+    anchor_s = anchor_s if anchor_s is not None else _env_int("SOMA_TREND_ANCHOR_S", 1800)
     anchor = prev.get("anchor")
     if (not isinstance(anchor, dict) or (now - anchor.get("ts", 0)) >= anchor_s
             or anchor.get("ts", 0) > now):
@@ -356,12 +356,17 @@ def compute_trends(state: dict, anchor: dict | None, now: float) -> dict:
     mem_gb_h negative = draining (mem_tte_h = hours to empty at that rate);
     per-mount gb_h positive = filling (ttf_h = hours to full); top_gb_h only
     when the same process is still the top consumer. {} when the anchor is
-    missing or under a minute old (rates would be noise).
+    missing or younger than SOMA_TREND_MIN_DT_S (a short real burst divided
+    by a tiny window extrapolates to an absurd hourly rate).
     """
     if not isinstance(anchor, dict):
         return {}
+    anchor_s = _env_int("SOMA_TREND_ANCHOR_S", 1800)
+    # floor must stay below the anchor refresh period or dt never reaches it
+    # and trends go permanently silent
+    min_dt_s = min(_env_int("SOMA_TREND_MIN_DT_S", 900), int(anchor_s * 0.75))
     dt_h = (now - anchor.get("ts", now)) / 3600.0
-    if dt_h < 1 / 60:
+    if dt_h < min_dt_s / 3600.0:
         return {}
     out = {}
     avail = state.get("mem", {}).get("MemAvailable")

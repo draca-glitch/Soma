@@ -361,6 +361,26 @@ def test_compute_trends_guards():
     assert "top_gb_h" not in soma_lib.compute_trends(state2, anchor, now=3600.0)  # top changed hands
 
 
+def test_compute_trends_burst_window_floor():
+    # a real 3G delta over 2 minutes must not extrapolate to a ~90G/h rate;
+    # rates only compute once the window reaches SOMA_TREND_MIN_DT_S
+    state = _healthy_state(mem={"MemTotal": 64000000, "MemAvailable": 37000000,
+                                "SwapTotal": 0, "SwapFree": 0})
+    assert soma_lib.compute_trends(state, _anchor(ts=0.0, avail_kb=40000000), now=120.0) == {}
+    t = soma_lib.compute_trends(state, _anchor(ts=0.0, avail_kb=40000000), now=1200.0)
+    assert round(t["mem_gb_h"], 1) == round(-3000000 / 1048576 / (1200 / 3600), 1)
+
+
+def test_compute_trends_floor_clamped_below_anchor(monkeypatch):
+    # a floor above the anchor refresh period would keep dt below it forever
+    # (trends permanently silent); the floor clamps to 0.75 * anchor_s
+    monkeypatch.setenv("SOMA_TREND_MIN_DT_S", "3600")
+    monkeypatch.setenv("SOMA_TREND_ANCHOR_S", "1200")
+    state = _healthy_state(mem={"MemTotal": 64000000, "MemAvailable": 37000000,
+                                "SwapTotal": 0, "SwapFree": 0})
+    assert soma_lib.compute_trends(state, _anchor(ts=0.0, avail_kb=40000000), now=1000.0) != {}
+
+
 def test_roll_state_anchor_window():
     state = _healthy_state()
     prev = {"counters": {}, "anchor": _anchor(ts=1000.0)}

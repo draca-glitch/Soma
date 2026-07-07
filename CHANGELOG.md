@@ -8,6 +8,16 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+## [0.9.1] - 2026-07-07
+
+Trend rates no longer over-extrapolate short bursts.
+
+### Fixed
+- **Burst over-extrapolation in `compute_trends()`**: the rate window floor was 1 minute, so a short real burst (mnemos-mcp loading ONNX models, a few GB over ~2 minutes) divided by a tiny dt produced absurd GB/h readings (observed +25.4G/h GROW and -12.4G/h DRAIN on a healthy box). New floor `SOMA_TREND_MIN_DT_S` (default 900) bounds worst-case extrapolation to 4x a burst's real delta.
+- **`SOMA_TREND_ANCHOR_S` default raised 600 -> 1800** so the anchor window comfortably exceeds the new floor; rates are now measured over 15-30 minute windows.
+- **Floor/anchor dead-lock guard**: the floor clamps to 0.75 * anchor_s; without this, a floor at or above the anchor refresh period keeps dt below the floor forever and trends go permanently silent.
+- 2 new tests (64 total).
+
 ## [0.9.0] - 2026-06-11
 
 Full-body thermoception: every hwmon chip a small machine actually carries.
