@@ -8,6 +8,18 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+## [0.9.2] - 2026-09-03
+
+The top slot ranks on private memory; mmap-heavy processes no longer mask the real consumer.
+
+### Fixed
+- **`top_rss()` ranked on resident set**, so any process that memory-maps large files won the "top process" slot with reclaimable page cache and hid the genuine consumer. Observed on a 30.8G NUC: `top qbittorrent-nox 15.5G(49.2%)(TOP)` with 25G available and memory PSI at zero; that process held 0.17G anonymous and 14.6G file-backed, while mnemos at 2.72G anonymous, the process with a documented memory profile worth watching, was invisible. Ranking now uses anonymous memory (statm resident minus shared, same read, no extra syscall). `rss_kb` stays in the entry; `anon_kb` is added.
+- **`self_tree_rss()`** sums anonymous memory the same way, so the agent's own tree is not inflated by whatever it has mapped.
+- **`assess()`, `compute_trends()`, `snapshot_anchor()`** measure `TOP`, `SELF` and `GROW` on `anon_kb`, falling back to `rss_kb` for state written before this release (one anchor window, then consistent).
+- **Rendering**: private memory is the primary figure; the resident total is appended only when file-backed pages dominate and exceed 256M: `top qbittorrent-nox 174M(0.6%, 15.5G mapped)`. Anon-heavy processes render exactly as before.
+- Thresholds `SOMA_TOP_RSS_PCT` (25) and `SOMA_SELF_RSS_PCT` (40) keep their defaults and names: they were tuned against anon-heavy consumers (the README example is a 15.5G mnemos-mcp), and the mmap cases they used to fire on were the false positives this release removes. They now measure what they were meant to.
+- 8 new tests (72 total).
+
 ## [0.9.1] - 2026-07-07
 
 Trend rates no longer over-extrapolate short bursts.

@@ -25,15 +25,15 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 ## What it watches
 
 - **Memory**: available RAM as a share of total, and swap in use.
-- **Top consumer**: the single largest-RSS process, surfaced when it holds a notable share of RAM even if total memory is fine (the common case: one process quietly dominating a healthy box).
+- **Top consumer**: the process holding the most private (anonymous) memory, surfaced when it holds a notable share of RAM even if total memory is fine (the common case: one process quietly dominating a healthy box). Ranking is on private memory, not resident set: a process that memory-maps large files (a torrent client seeding, a media server, an mmap'd model runner) carries a resident set dominated by page cache the kernel reclaims on demand, and ranking on that let it win the slot and hide the real consumer. When the two diverge the line shows both: `top qbittorrent-nox 174M(0.6%, 15.5G mapped)`.
 - **Disk**: percent-used on a small mount watchlist.
 - **Load**: 1-minute load average against core count.
 - **Temperature**: hottest sensor per class (CPU, disk, GPU, RAM, board/PCH, wifi, ACPI zone) from sysfs hwmon, when the kernel exposes them. The body's fever check: a `(HOT)` tag on the class that crossed its ceiling. Placeholder readings outside -40..150°C (ACPI zones love publishing -263°C for unwired trip points) are dropped.
 - **Strain**: PSI stall shares (`/proc/pressure`, `some` avg10) for cpu/memory/io. The felt difference between busy-and-fine (high load, zero stall) and wedged (low load, high stall), which load average cannot express. Rendered as `psi 1/0/38%` in cpu/mem/io order.
 - **Pain**: damage events since the previous reading, from kernel counters: OOM kills (`/proc/vmstat`), ECC corrected/uncorrected memory errors (EDAC), and a degraded md RAID array. Levels are sensations; these are injuries. Counter baselines persist in `soma-state.json`, so an event is reported exactly once, at the next prompt after it happened.
-- **Self vs world**: the RSS of the agent's own process tree, found by walking from the hook to the nearest harness ancestor (`SOMA_SELF_COMM`) and summing its whole subtree: the harness, the MCP servers it spawned (the agent's organs), and any tool subprocesses currently running (the agent's own effort). `self claude[14] 12.1G(19.5%)`; flags `SELF` past `SOMA_SELF_RSS_PCT`. "I am heavy" is a different fact from "the world is heavy", and the agent should know which one it is feeling.
+- **Self vs world**: the private memory of the agent's own process tree, found by walking from the hook to the nearest harness ancestor (`SOMA_SELF_COMM`) and summing its whole subtree: the harness, the MCP servers it spawned (the agent's organs), and any tool subprocesses currently running (the agent's own effort). `self claude[14] 12.1G(19.5%)`; flags `SELF` past `SOMA_SELF_RSS_PCT`. "I am heavy" is a different fact from "the world is heavy", and the agent should know which one it is feeling.
 - **Numb limbs**: every mount probe runs in a watchdog thread under a shared deadline (`SOMA_MOUNT_TIMEOUT_MS`). A mount that stops answering (a network mount whose VPN dropped) is reported as `numb: /mnt/nas` with flag `NUMB` instead of hanging the hook, converting Soma's own worst failure mode into its most valuable mount signal. An agent that knows the limb is numb does not run the command that would have blocked on it.
-- **Movement**: rates of change against a rolling anchor (default 10 min window): RAM draining toward empty, a mount filling toward full, the top process growing. A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
+- **Movement**: rates of change against a rolling anchor (default 10 min window): RAM draining toward empty, a mount filling toward full, the top process growing (private memory, so a seeder paging files in does not read as growth). A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
 - **Steal** (virtualized hosts): hypervisor steal share over the trend window; see the VPS section below.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
 
@@ -100,7 +100,7 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_SWAP_MB` | `256` | flag when swap-in-use exceeds this many MB |
 | `SOMA_DISK_PCT` | `85` | flag when any watched mount exceeds this percent used |
 | `SOMA_LOAD_RATIO` | `1.0` | flag when 1-min load / cores exceeds this |
-| `SOMA_TOP_RSS_PCT` | `25` | flag the top process when its RSS exceeds this percent of total RAM; `0` disables |
+| `SOMA_TOP_RSS_PCT` | `25` | flag the top process when its private (anonymous) memory exceeds this percent of total RAM; `0` disables |
 | `SOMA_TEMP_CPU` | `85` | degC ceiling for the CPU sensor class (k10temp, coretemp, ...); `0` disables |
 | `SOMA_TEMP_DISK` | `70` | degC ceiling for the disk sensor class (nvme, drivetemp); `0` disables |
 | `SOMA_TEMP_GPU` | `90` | degC ceiling for the GPU sensor class (amdgpu, i915, ...); `0` disables |
@@ -111,9 +111,9 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_PSI_PCT` | `25` | flag `STRAIN` when any PSI `some` avg10 stall share crosses this percent; `0` disables |
 | `SOMA_MEM_TTE_H` | `2` | flag `DRAIN` when RAM would empty within this many hours (and is already below half) |
 | `SOMA_DISK_TTF_H` | `24` | flag `FILL` when a watched mount would fill within this many hours |
-| `SOMA_TOP_GROWTH_GBH` | `0.5` | flag `GROW` when the top process gains RSS faster than this many GB/h; `0` disables |
+| `SOMA_TOP_GROWTH_GBH` | `0.5` | flag `GROW` when the top process gains private memory faster than this many GB/h; `0` disables |
 | `SOMA_TREND_ANCHOR_S` | `600` | rolling anchor age for rate computation; rates are measured over at least this window |
-| `SOMA_SELF_RSS_PCT` | `40` | flag `SELF` when the agent's own process tree exceeds this percent of total RAM; `0` disables |
+| `SOMA_SELF_RSS_PCT` | `40` | flag `SELF` when the agent's own process tree's private memory exceeds this percent of total RAM; `0` disables |
 | `SOMA_SELF_COMM` | `claude,node` | comm names recognized as the harness ancestor when walking up from the hook |
 | `SOMA_MOUNT_TIMEOUT_MS` | `150` | shared deadline for all mount probes; a probe that misses it reports the mount as numb |
 | `SOMA_STEAL_PCT` | `10` | flag `STEAL` when hypervisor steal share over the trend window crosses this percent; `0` disables |

@@ -91,11 +91,34 @@ def parse_loadavg(text: str) -> tuple:
         return (0.0, 0.0, 0.0)
 
 
-def top_rss(proc_root: str = "/proc") -> dict | None:
-    """Process with the largest resident set. {name, rss_kb} or None.
+MAPPED_NOTE_MIN_KB = 256 * 1024
 
-    Reads statm (resident pages) + comm per pid. Races (pid exiting
-    mid-scan) are skipped, not fatal.
+
+def _statm_kb(entry: Path) -> tuple:
+    """(rss_kb, anon_kb) for one pid from statm, a single read.
+
+    Field 2 is resident pages, field 3 the file-backed share of them (page
+    cache the kernel reclaims on demand). Their difference is the private,
+    anonymous memory a process actually holds; a torrent client seeding
+    15G of mmap'd files sits at 15G resident and ~0.2G anonymous.
+    """
+    fields = (entry / "statm").read_text().split()
+    resident, shared = int(fields[1]), int(fields[2])
+    return int(resident * PAGE_KB), max(0, int((resident - shared) * PAGE_KB))
+
+
+def _anon_kb(entry: dict) -> int:
+    """Private memory of a top/self entry; resident for entries recorded before anon existed."""
+    return entry.get("anon_kb", entry.get("rss_kb", 0))
+
+
+def top_rss(proc_root: str = "/proc") -> dict | None:
+    """Process holding the most private (anonymous) memory. {name, rss_kb, anon_kb} or None.
+
+    Ranks on anonymous memory, not resident set: ranking on resident let an
+    mmap-heavy process (torrent seeder, media server, mmap'd model runner)
+    win the slot with reclaimable page cache and hide the real consumer.
+    Races (pid exiting mid-scan) are skipped, not fatal.
     """
     best = None
     root = Path(proc_root)
@@ -107,16 +130,15 @@ def top_rss(proc_root: str = "/proc") -> dict | None:
         if not entry.name.isdigit():
             continue
         try:
-            resident_pages = int((entry / "statm").read_text().split()[1])
+            rss_kb, anon_kb = _statm_kb(entry)
         except (OSError, IndexError, ValueError):
             continue
-        rss_kb = int(resident_pages * PAGE_KB)
-        if best is None or rss_kb > best["rss_kb"]:
+        if best is None or anon_kb > best["anon_kb"]:
             try:
                 name = (entry / "comm").read_text().strip()
             except OSError:
                 name = f"pid{entry.name}"
-            best = {"name": name, "rss_kb": rss_kb}
+            best = {"name": name, "rss_kb": rss_kb, "anon_kb": anon_kb}
     return best
 
 
@@ -166,7 +188,7 @@ def disk_usage(paths: list, timeout_s: float | None = None) -> dict:
 
 
 def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict | None:
-    """RSS of the agent's own process tree. {name, rss_kb, procs} or None.
+    """Memory of the agent's own process tree. {name, rss_kb, anon_kb, procs} or None.
 
     The body boundary: 'I am heavy' is a different fact from 'the world is
     heavy'. Self is the nearest ancestor of this hook whose comm matches
@@ -179,7 +201,7 @@ def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict
     self_names = set(_env_list("SOMA_SELF_COMM", ["claude", "node"]))
     self_pid = self_pid if self_pid is not None else os.getpid()
     root = Path(proc_root)
-    ppid_of, comm_of, rss_of, kids_of = {}, {}, {}, {}
+    ppid_of, comm_of, rss_of, anon_of, kids_of = {}, {}, {}, {}, {}
     try:
         entries = list(root.iterdir())
     except OSError:
@@ -190,7 +212,7 @@ def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict
         pid = int(entry.name)
         try:
             stat = (entry / "stat").read_text()
-            resident_pages = int((entry / "statm").read_text().split()[1])
+            rss_kb, anon_kb = _statm_kb(entry)
         except (OSError, IndexError, ValueError):
             continue
         try:
@@ -200,7 +222,8 @@ def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict
             continue
         ppid_of[pid] = ppid
         comm_of[pid] = comm
-        rss_of[pid] = int(resident_pages * PAGE_KB)
+        rss_of[pid] = rss_kb
+        anon_of[pid] = anon_kb
         kids_of.setdefault(ppid, []).append(pid)
     if self_pid not in ppid_of:
         return None
@@ -216,16 +239,17 @@ def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict
         anchor = ppid_of.get(self_pid, self_pid)
         if anchor not in ppid_of:
             anchor = self_pid
-    total, count, queue, visited = 0, 0, [anchor], set()
+    total, anon, count, queue, visited = 0, 0, 0, [anchor], set()
     while queue:
         pid = queue.pop()
         if pid in visited:
             continue
         visited.add(pid)
         total += rss_of.get(pid, 0)
+        anon += anon_of.get(pid, 0)
         count += 1
         queue.extend(kids_of.get(pid, []))
-    return {"name": comm_of.get(anchor, f"pid{anchor}"), "rss_kb": total, "procs": count}
+    return {"name": comm_of.get(anchor, f"pid{anchor}"), "rss_kb": total, "anon_kb": anon, "procs": count}
 
 
 def read_psi(proc_root: str = "/proc") -> dict:
@@ -333,7 +357,7 @@ def snapshot_anchor(state: dict, now: float) -> dict:
         "ts": now,
         "mem_avail_kb": mem.get("MemAvailable"),
         "disks": {d["mount"]: d["free_kb"] for d in state.get("disks", [])},
-        "top": {"name": top["name"], "rss_kb": top["rss_kb"]} if top else None,
+        "top": {"name": top["name"], "rss_kb": top["rss_kb"], "anon_kb": _anon_kb(top)} if top else None,
         "jiffies": state.get("jiffies"),
     }
 
@@ -391,7 +415,7 @@ def compute_trends(state: dict, anchor: dict | None, now: float) -> dict:
     top, a_top = state.get("top"), anchor.get("top")
     if (top and isinstance(a_top, dict) and top.get("name") == a_top.get("name")
             and a_top.get("rss_kb") is not None):
-        out["top_gb_h"] = (top["rss_kb"] - a_top["rss_kb"]) / 1048576 / dt_h
+        out["top_gb_h"] = (_anon_kb(top) - _anon_kb(a_top)) / 1048576 / dt_h
     jif, a_jif = state.get("jiffies"), anchor.get("jiffies")
     if jif and isinstance(a_jif, dict) and a_jif.get("total") is not None:
         d_total = jif["total"] - a_jif["total"]
@@ -561,9 +585,9 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None,
     load1 = state.get("load", (0.0,))[0]
     load_ratio = load1 / cores if cores else 0.0
     top = state.get("top")
-    top_pct = (top["rss_kb"] / total * 100) if (top and total) else 0.0
+    top_pct = (_anon_kb(top) / total * 100) if (top and total) else 0.0
     own = state.get("self")
-    self_pct = (own["rss_kb"] / total * 100) if (own and total) else 0.0
+    self_pct = (_anon_kb(own) / total * 100) if (own and total) else 0.0
 
     if total and mem_avail_pct < th["mem_avail_pct"]:
         flags.add("LOW_MEM")
@@ -630,6 +654,14 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None,
     }
 
 
+def _mem_figure(entry: dict, pct: float) -> str:
+    """'2.7G(8.8%)' on private memory; adds ', 15.5G mapped' when file-backed pages dominate."""
+    anon = _anon_kb(entry)
+    mapped = entry.get("rss_kb", 0) - anon
+    note = f", {human_kb(entry['rss_kb'])} mapped" if (mapped > anon and mapped >= MAPPED_NOTE_MIN_KB) else ""
+    return f"{human_kb(anon)}({pct:.1f}%{note})"
+
+
 def render(state: dict, a: dict) -> str:
     """One compact [system-state] line. Crossing fields carry an inline flag."""
     mem = state.get("mem", {})
@@ -652,11 +684,11 @@ def render(state: dict, a: dict) -> str:
         tag = "(TOP)" if "TOP" in a["flags"] else ""
         if "GROW" in a["flags"]:
             tag += f" (+{trends['top_gb_h']:.1f}G/h)(GROW)"
-        parts.append(f"top {top['name']} {human_kb(top['rss_kb'])}({a['top_pct']:.1f}%){tag}")
+        parts.append(f"top {top['name']} {_mem_figure(top, a['top_pct'])}{tag}")
     own = state.get("self")
     if own and total:
         tag = "(SELF)" if "SELF" in a["flags"] else ""
-        parts.append(f"self {own['name']}[{own['procs']}] {human_kb(own['rss_kb'])}({a['self_pct']:.1f}%){tag}")
+        parts.append(f"self {own['name']}[{own['procs']}] {_mem_figure(own, a['self_pct'])}{tag}")
     worst = max(state.get("disks", []), key=lambda d: d["pct"], default=None)
     if worst:
         tag = "(HIGH)" if "DISK" in a["flags"] else ""

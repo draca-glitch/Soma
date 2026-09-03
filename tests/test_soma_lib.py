@@ -44,6 +44,7 @@ def test_top_rss(tmp_path):
     top = soma_lib.top_rss(str(tmp_path))
     assert top["name"] == "big"
     assert top["rss_kb"] == int(500 * soma_lib.PAGE_KB)
+    assert top["anon_kb"] == int((500 - 100) * soma_lib.PAGE_KB)
 
 
 def test_top_rss_empty(tmp_path):
@@ -523,6 +524,7 @@ def test_self_tree_rss_finds_harness_ancestor(tmp_path):
     assert own["name"] == "claude"
     assert own["procs"] == 3
     assert own["rss_kb"] == int((500 + 900 + 30) * soma_lib.PAGE_KB)
+    assert own["anon_kb"] == int((490 + 890 + 20) * soma_lib.PAGE_KB)
 
 
 def test_self_tree_rss_fallback_to_parent(tmp_path):
@@ -598,3 +600,87 @@ def test_render_steal_hidden_when_negligible():
     a = soma_lib.assess(state, trends={"steal_pct": 0.1})
     assert "STEAL" not in a["flags"]
     assert "steal" not in soma_lib.render(state, a)
+
+
+# --- anonymous vs file-backed memory (mmap-heavy processes must not win the top slot) ---
+
+def _fake_statm_procs(tmp_path, procs):
+    for pid, name, resident, shared in procs:
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "statm").write_text(f"{resident + 100} {resident} {shared} 1 0 200 0\n")
+        (d / "comm").write_text(name + "\n")
+    return str(tmp_path)
+
+
+def test_top_rss_ranks_on_anon_not_resident(tmp_path):
+    root = _fake_statm_procs(tmp_path, [
+        (100, "seeder", 4000, 3900),   # 15.5G-style mmap'd torrent data, 100 pages private
+        (200, "mnemos", 700, 0),       # the real consumer
+    ])
+    top = soma_lib.top_rss(root)
+    assert top["name"] == "mnemos"
+    assert top["rss_kb"] == int(700 * soma_lib.PAGE_KB)
+    assert top["anon_kb"] == int(700 * soma_lib.PAGE_KB)
+
+
+def test_top_rss_anon_clamped_nonnegative(tmp_path):
+    root = _fake_statm_procs(tmp_path, [(100, "odd", 10, 100)])
+    top = soma_lib.top_rss(root)
+    assert top["anon_kb"] == 0
+    assert top["rss_kb"] == int(10 * soma_lib.PAGE_KB)
+
+
+def test_assess_top_and_self_use_anon():
+    state = _healthy_state(
+        top={"name": "seeder", "rss_kb": 32000000, "anon_kb": 200000},   # half of RAM resident, tiny private
+        self={"name": "claude", "rss_kb": 30000000, "anon_kb": 1000000, "procs": 3})
+    a = soma_lib.assess(state)
+    assert "TOP" not in a["flags"]
+    assert "SELF" not in a["flags"]
+    assert abs(a["top_pct"] - 0.3125) < 1e-6
+    assert abs(a["self_pct"] - 1.5625) < 1e-6
+
+
+def test_assess_falls_back_to_resident_without_anon():
+    a = soma_lib.assess(_healthy_state(top={"name": "legacy", "rss_kb": 32000000}))
+    assert "TOP" in a["flags"]
+    assert a["top_pct"] == 50.0
+
+
+def test_render_mapped_note_only_when_divergent():
+    state = _healthy_state(
+        mem={"MemTotal": 32000000, "MemAvailable": 25000000, "SwapTotal": 0, "SwapFree": 0},
+        top={"name": "seeder", "rss_kb": 16252928, "anon_kb": 178000},
+        self={"name": "claude", "rss_kb": 8000000, "anon_kb": 1000000, "procs": 4})
+    line = soma_lib.render(state, soma_lib.assess(state))
+    assert "top seeder 174M(0.6%, 15.5G mapped)" in line
+    assert "self claude[4] 977M(3.1%, 7.6G mapped)" in line
+    state = _healthy_state(
+        mem={"MemTotal": 32000000, "MemAvailable": 25000000, "SwapTotal": 0, "SwapFree": 0},
+        top={"name": "mnemos", "rss_kb": 2900000, "anon_kb": 2850000},
+        self={"name": "claude", "rss_kb": 4000000, "anon_kb": 3900000, "procs": 4})
+    line = soma_lib.render(state, soma_lib.assess(state))
+    assert "top mnemos 2.7G(8.9%)" in line
+    assert "self claude[4] 3.7G(12.2%)" in line
+    assert "mapped" not in line
+
+
+def test_render_small_file_share_not_noted():
+    # file part below the absolute floor is noise, not a mapping story
+    state = _healthy_state(top={"name": "tiny", "rss_kb": 300000, "anon_kb": 100000})
+    line = soma_lib.render(state, soma_lib.assess(state))
+    assert "mapped" not in line
+
+
+def test_snapshot_anchor_carries_anon():
+    state = _healthy_state(top={"name": "mnemos", "rss_kb": 2900000, "anon_kb": 2850000})
+    anchor = soma_lib.snapshot_anchor(state, 0.0)
+    assert anchor["top"] == {"name": "mnemos", "rss_kb": 2900000, "anon_kb": 2850000}
+
+
+def test_compute_trends_top_growth_on_anon():
+    state = _healthy_state(top={"name": "seeder", "rss_kb": 20000000, "anon_kb": 10000000})
+    anchor = _anchor(ts=0.0, top={"name": "seeder", "rss_kb": 9000000, "anon_kb": 9000000})
+    t = soma_lib.compute_trends(state, anchor, now=3600.0)
+    assert abs(t["top_gb_h"] - (1000000 / 1048576)) < 1e-6
