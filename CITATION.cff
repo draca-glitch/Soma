@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+title: Soma
+message: If you use this software, cite it using these metadata.
+type: software
+authors:
+  - family-names: Wedlund
+    given-names: Mikael
+    alias: draca-glitch
+    website: https://eastblue.se/mikael-wedlund
+license: MIT
+repository-code: https://github.com/draca-glitch/Soma
+url: https://eastblue.se/mikael-wedlund

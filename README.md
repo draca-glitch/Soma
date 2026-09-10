@@ -1,5 +1,7 @@
 # Soma
 
+**Author:** [Mikael Wedlund](https://eastblue.se/mikael-wedlund) (`draca-glitch`)
+
 **Body-state awareness for AI agents.** The body axis of the self-grounding triad.
 
 | Sibling | Greek | Axis | The question it answers |

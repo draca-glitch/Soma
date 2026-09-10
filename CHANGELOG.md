@@ -8,6 +8,9 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+### Changed
+- Public author identity is Mikael Wedlund (`CITATION.cff`, LICENSE, README). The GitHub account remains `draca-glitch`.
+
 ## [0.9.2] - 2026-09-03
 
 The top slot ranks on private memory; mmap-heavy processes no longer mask the real consumer.
