@@ -20,7 +20,11 @@ State file: <state_dir>/soma-ctx/<session_id>.json
    "five_hour": {"used_pct": 7, "resets_at": 1791327000} | null,
    "seven_day": {"used_pct": 19, "resets_at": 1791723600} | null,
    "samples": [{"ts", "used_tokens", "used_pct", "five_pct", "seven_pct"}, ...] (<= 24, 0.12.0),
-   "model": "claude-opus-5-5", "model_prev": ..., "model_changed_ts": ..., "cost": 41.2, "rl_seen": true}
+   "five_series": [{"ts", "pct"}, ...] (the 5-hour window, <= one point per 300 s, <= 24, 0.12.0),
+   "model": "claude-opus-5-5", "model_prev": ..., "model_changed_ts": ..., "model_first": ...,
+   "cost": 41.2, "rl_seen": true}
+The model this session was last told about (hook side): <state_dir>/soma-model/<session_id>.json
+  {"told": "claude-opus-5-5"}, written only when a notice is said.
 The prompt hook's own fill-per-turn history: <state_dir>/soma-turns/<session_id>.json
   {"fills": [[statusline ts, fill pct], ...]} (<= 4), written only by the prompt hook.
 
@@ -54,13 +58,19 @@ OFF_VALUES = ("0", "off", "false", "no")
 SAMPLES_MAX = 24               # usage history kept in the state file (one entry per change of used_tokens)
 MODEL_MAX = 128                # a model id longer than this is junk
 COST_MAX = 1e6                 # a session cost above this many dollars is junk
+MODEL_SUBDIR = "soma-model"    # the hook side's record of the model this session was last told
 TURNS_SUBDIR = "soma-turns"    # the prompt hook's per-session fill-per-turn history
 TURNS_KEEP = 4                 # fills kept: the last 3 completed turns
 TURNS_MIN = 2                  # completed turns needed before a rate is shown
 TURNS_SHOW_MAX = 10            # the rate is shown only when this few turns are left
-QUOTA_MIN_SPAN_S = 600         # a quota rate needs at least this much history
+SERIES_STEP_S = 300            # the 5-hour series keeps at most one point per this many seconds
+SERIES_MAX = 24                # ... and at most this many points (two hours)
+QUOTA_MIN_SPAN_S = 900         # a quota rate needs at least this much history
+QUOTA_MIN_RISE = 5             # ... rising at least this many points over it (whole percentages)
+QUOTA_BURST_RISE = 3           # the recent third leads the rate only when it alone rises this much
+QUOTA_FRESH_S = 600            # a series whose newest point is older than this projects nothing
 QUOTA_FLAG_PCT = 50            # QUOTA is raised only for a window at least this used
-WINDOW_S = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+WINDOW_S = 5 * 3600            # the five-hour window (the only one projected)
 NOTICE_MAX_AGE_S = 86400       # a model change older than this is not announced
 DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -151,6 +161,29 @@ def _samples(x) -> list:
     return out
 
 
+def _series(x) -> list:
+    """The stored 5-hour series, keeping only well-formed points (an older file has none)."""
+    if not isinstance(x, list):
+        return []
+    return [{"ts": int(p["ts"]), "pct": int(p["pct"])} for p in x[-SERIES_MAX:]
+            if isinstance(p, dict) and _num(p.get("ts")) and _pct(p.get("pct"), RATE_PCT_MAX) is not None]
+
+
+def _next_series(old: dict, fh, now: float) -> list:
+    """The 5-hour series after this reading: a point at most every SERIES_STEP_S, started over
+    when the window resets (its use falls or its resets_at changes) or the clock goes back."""
+    series = _series(old.get("five_series"))
+    if not fh:
+        return series
+    ofh = old.get("five_hour")
+    if series and (fh["used_pct"] < series[-1]["pct"] or now < series[-1]["ts"]
+                   or not isinstance(ofh, dict) or ofh.get("resets_at") != fh["resets_at"]):
+        series = []
+    if not series or now - series[-1]["ts"] >= SERIES_STEP_S:
+        series.append({"ts": int(now), "pct": fh["used_pct"]})
+    return series[-SERIES_MAX:]
+
+
 def write_from_statusline(doc, sdir: str | None = None, now: float | None = None) -> None:
     """Persist the statusline's context and rate-limit numbers for this session. Never raises."""
     try:
@@ -186,8 +219,10 @@ def write_from_statusline(doc, sdir: str | None = None, now: float | None = None
                             "five_pct": out["five_hour"]["used_pct"] if out["five_hour"] else None,
                             "seven_pct": out["seven_day"]["used_pct"] if out["seven_day"] else None})
         out["samples"] = samples[-SAMPLES_MAX:]
+        out["five_series"] = _next_series(old, out["five_hour"], now)
         prev = _model_id(old.get("model"))
         out["model"] = model or prev
+        out["model_first"] = _model_id(old.get("model_first")) or prev or model
         if model and prev and model != prev:
             out["model_prev"], out["model_changed_ts"] = prev, int(now)
         elif out["model"] == prev and _model_id(old.get("model_prev")) and _num(old.get("model_changed_ts")):
@@ -355,11 +390,13 @@ def _last_compaction(sid: str, doc: dict, sdir: str | None) -> float:
 
 
 def _turn_rate(sid: str, doc: dict, fill: float, sdir: str | None, record: bool) -> tuple:
-    """(mean fill growth per completed turn in points, turns known) from the prompt hook's own
+    """(fill growth per completed turn in points, turns known) from the prompt hook's own
     history (<state_dir>/soma-turns/<sid>.json), after noting this prompt's reading when
-    record is set. A reading the history already holds (same statusline ts) is not a new
-    turn; a fill that drops (a compaction) or a reading older than the last one (a clock gone
-    back) starts the history over. Never raises; (None, 0) when there is nothing to say."""
+    record is set. The growth is the larger of the mean of the last up to 3 turns and the
+    latest turn alone, so a big latest turn is not averaged away. A real turn always adds
+    tokens: a reading with the same statusline ts or the same fill is not a new turn; a fill
+    that drops (a compaction) or a reading older than the last one (a clock gone back)
+    starts the history over. Never raises; (None, 0) when there is nothing to say."""
     try:
         old = read_session_json(TURNS_SUBDIR, sid, sdir) or {}
         fills = old.get("fills")
@@ -369,7 +406,7 @@ def _turn_rate(sid: str, doc: dict, fill: float, sdir: str | None, record: bool)
         if record and _num(ts):
             if not fills or ts < fills[-1][0] or fill < fills[-1][1]:
                 fills = [[ts, fill]]
-            elif ts > fills[-1][0]:
+            elif ts > fills[-1][0] and fill > fills[-1][1]:
                 fills = (fills + [[ts, fill]])[-TURNS_KEEP:]
             write_session_json(TURNS_SUBDIR, sid, {"fills": fills}, sdir)
         # a compaction since a stored fill makes every delta across it meaningless, even when
@@ -380,37 +417,50 @@ def _turn_rate(sid: str, doc: dict, fill: float, sdir: str | None, record: bool)
             if b[0] <= a[0] or b[1] < a[1]:
                 return None, 0
         n = len(fills) - 1
-        if n < 1 or not fills or fills[-1][0] != ts:
+        # the history ends at this reading: the same statusline ts, or the same fill (a refresh
+        # without growth, kept under the earlier ts)
+        if n < 1 or not _num(ts) or ts < fills[-1][0] or (fills[-1][0] != ts and fills[-1][1] != fill):
             return None, 0
-        return (fills[-1][1] - fills[0][1]) / n, n
+        return max((fills[-1][1] - fills[0][1]) / n, fills[-1][1] - fills[-2][1]), n
     except Exception:
         return None, 0
 
 
-def _projection(doc: dict, key: str, pkey: str, wp: int, reset, now: float) -> int | None:
-    """Epoch second at which this quota window runs out at its recent linear rate, or None
-    when the figure would be doubtful: under 2 points or 10 minutes of history, a series that
-    is not strictly later in time and non-decreasing in use, history from before the window's
-    last reset, a reading from the future, a flat or falling rate, or an exhaustion that
-    would not come before the reset."""
+def _rate(pts: list) -> float | None:
+    """Points per second over a series of (ts, pct), or None when its span is empty."""
+    span = pts[-1][0] - pts[0][0]
+    return (pts[-1][1] - pts[0][1]) / span if span > 0 else None
+
+
+def _projection(doc: dict, wp: int, reset, now: float) -> int | None:
+    """Epoch second at which the 5-hour window runs out, or None when the evidence is thin.
+    Read from the sparse series only, never from the per-token samples: whole percentages
+    over a few minutes are rounding noise. Needs a series that is strictly later in time and
+    non-decreasing in use, starts inside the current window, spans QUOTA_MIN_SPAN_S, rises
+    QUOTA_MIN_RISE points and has a newest point at most QUOTA_FRESH_S old and not from the
+    future. The rate is the higher of the whole span's and, when it alone rises
+    QUOTA_BURST_RISE points, the most recent third's (pessimistic on purpose). None also for
+    a run-out that is past or would not come before the reset."""
     if reset is None or reset <= now or wp >= 100:
         return None
-    pts = [(s["ts"], s[pkey]) for s in _samples(doc.get("samples")) if s[pkey] is not None]
-    # the series always ends at the current reading, so quiet time since the last change of
-    # used_tokens lowers the rate instead of being left out of it
-    if not pts or int(doc["ts"]) > pts[-1][0]:
-        pts.append((int(doc["ts"]), wp))
-    elif pts[-1] != (int(doc["ts"]), wp):
-        return None
-    if len(pts) < 2 or pts[-1][0] > now + 60 or pts[0][0] < reset - WINDOW_S[key]:
+    pts = [(p["ts"], p["pct"]) for p in _series(doc.get("five_series"))]
+    if len(pts) < 2 or not 0 <= now - pts[-1][0] <= QUOTA_FRESH_S or pts[0][0] < reset - WINDOW_S:
         return None
     for a, b in zip(pts, pts[1:]):
         if b[0] <= a[0] or b[1] < a[1]:
             return None
     span = pts[-1][0] - pts[0][0]
-    if span < QUOTA_MIN_SPAN_S or pts[-1][1] <= pts[0][1]:
+    if span < QUOTA_MIN_SPAN_S or pts[-1][1] - pts[0][1] < QUOTA_MIN_RISE:
         return None
-    out = pts[-1][0] + (100 - pts[-1][1]) * span / (pts[-1][1] - pts[0][1])
+    rate = _rate(pts)
+    recent = [p for p in pts if p[0] >= pts[-1][0] - span / 3]
+    if len(recent) >= 2 and recent[-1][1] - recent[0][1] >= QUOTA_BURST_RISE:
+        rate = max(rate, _rate(recent))
+    # count from the current reading when it is newer and no lower than the series' end
+    base_ts, base = pts[-1]
+    if _num(doc.get("ts")) and base_ts <= doc["ts"] <= now + 60 and wp >= base:
+        base_ts, base = int(doc["ts"]), wp
+    out = base_ts + (100 - base) / rate
     return int(out) if now < out < reset else None
 
 
@@ -421,9 +471,9 @@ def context_reading(hook_input, sdir: str | None = None, now: float | None = Non
 
     Off with SOMA_CTX=0|off|false|no. High when the used share reaches SOMA_CTX_PCT (default 85;
     0 disables). The fill rate is shown only when it says something (2+ turns, growing, at most
-    10 turns to SOMA_CTX_FULL_PCT, default 95); a quota projection only when the window runs
-    out before it resets, and quota is True when that window is at 50 % or more (SOMA_QUOTA=0
-    turns both off). Cost only on a session that has never carried rate_limits. A main-agent
+    10 turns to SOMA_CTX_FULL_PCT, default 95); a quota projection only for the 5-hour window,
+    only on enough evidence (see _projection), and quota is True only with a printed projection
+    on a window at 50 % or more (SOMA_QUOTA=0 turns both off). The 7-day window prints its level. Cost only on a session that has never carried rate_limits. A main-agent
     call (no agent_id) notes this prompt's fill as a turn."""
     res = {"seg": None, "high": False, "quota": False}
     try:
@@ -447,8 +497,10 @@ def context_reading(hook_input, sdir: str | None = None, now: float | None = Non
             full = _env_pos_float("SOMA_CTX_FULL_PCT", 95.0)
             extra = ""
             if rate and rate > 0 and n >= TURNS_MIN and fill < full:
-                left = math.ceil((full - fill) / rate)
-                if left <= TURNS_SHOW_MAX:
+                # rounded first: 3.2 / 0.4 is 8.000000000000002 in floats, and 8 turns, not 9
+                q = round((full - fill) / rate, 6)
+                left = math.ceil(q)
+                if q <= TURNS_SHOW_MAX:
                     r = round(rate)
                     extra = (f", +{r}%/turn" if r >= 1 else ", +<1%/turn") \
                         + f", ~{left} turn{'s' if left != 1 else ''} left"
@@ -460,7 +512,7 @@ def context_reading(hook_input, sdir: str | None = None, now: float | None = Non
             if tokens and tokens >= 1000:  # below that "ctx 0k" says nothing
                 parts.append(f"ctx {_k(tokens)}")
         quota_on = os.environ.get("SOMA_QUOTA", "1").strip().lower() not in OFF_VALUES
-        for key, label, pkey in (("five_hour", "5h", "five_pct"), ("seven_day", "7d", "seven_pct")):
+        for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
             w = doc.get(key)
             wp = _pct(w.get("used_pct"), RATE_PCT_MAX) if isinstance(w, dict) else None
             if wp is None:
@@ -468,10 +520,11 @@ def context_reading(hook_input, sdir: str | None = None, now: float | None = Non
             reset = _epoch(w.get("resets_at"))
             if reset is not None and reset <= now:
                 continue  # the window has rolled over; its old figure is no longer true
-            out = _projection(doc, key, pkey, wp, reset, now) if quota_on else None
+            # the 7-day window is never projected: a 1-point step of a whole percentage inside
+            # the minutes a session sees reads as a run-out days early (0.12.0 fix round A)
+            out = _projection(doc, wp, reset, now) if quota_on and key == "five_hour" else None
             if out is not None:
-                wd = key == "seven_day"
-                parts.append(f"{label} {wp}% (out ~{_hm(out, wd)}, resets {_hm(reset, wd)})")
+                parts.append(f"{label} {wp}% (out ~{_hm(out)}, resets {_hm(reset)})")
                 res["quota"] = res["quota"] or wp >= QUOTA_FLAG_PCT
             else:
                 parts.append(f"{label} {wp}%")
@@ -492,23 +545,28 @@ def context_segment(hook_input, sdir: str | None = None, now: float | None = Non
 
 
 def take_model_notice(sid, sdir: str | None = None, now: float | None = None) -> str | None:
-    """'model <id> (was <prev> until HH:MM)' when the statusline saw the serving model change,
-    claimed once per change through an exclusive file; None when there is no change, it is
-    older than 24 h, it was already said, or the state is junk. Never raises."""
+    """'model <id> (was <told> until HH:MM)' when the serving model differs from the one this
+    session was last told about (or, before any notice, the first one its statusline saw),
+    once per change through an exclusive claim keyed by the change time and the new model.
+    A change away and back before a prompt says nothing. None when there is no change, it is
+    older than 24 h or from the future, it was already said, or the state is junk. Never raises."""
     try:
         s = safe_id(sid)
         if not s or os.environ.get("SOMA_CTX", "1").strip().lower() in OFF_VALUES:
             return None
         now = time.time() if now is None else now
         doc = read_state(s, sdir, now) or {}
-        model, prev, ts = _model_id(doc.get("model")), _model_id(doc.get("model_prev")), doc.get("model_changed_ts")
-        if not model or not prev or model == prev or not _num(ts) or not 0 <= now - ts <= NOTICE_MAX_AGE_S:
+        model, ts = _model_id(doc.get("model")), doc.get("model_changed_ts")
+        rec = read_session_json(MODEL_SUBDIR, s, sdir) or {}
+        told = _model_id(rec.get("told")) or _model_id(doc.get("model_first")) or _model_id(doc.get("model_prev"))
+        if not model or not told or model == told or not _num(ts) or not 0 <= now - ts <= NOTICE_MAX_AGE_S:
             return None
-        claim = os.path.join(state_dir(sdir), CTX_SUBDIR, f"{s}.model.{int(ts)}.claim")
+        claim = os.path.join(state_dir(sdir), CTX_SUBDIR, f"{s}.model.{int(ts)}.{safe_id(model)}.claim")
         try:
             os.close(os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         except OSError:
             return None
-        return f"model {model} (was {prev} until {_hm(ts)})"
+        write_session_json(MODEL_SUBDIR, s, {"told": model}, sdir, now)
+        return f"model {model} (was {told} until {_hm(ts)})"
     except Exception:
         return None

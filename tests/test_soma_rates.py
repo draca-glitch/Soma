@@ -113,8 +113,8 @@ def test_turn_rate_sequence(tmp_path):
     assert _turn(tmp_path, 59, N + 60).startswith("ctx 59% (590k/1000k) ·")  # one turn: not enough
     assert _turn(tmp_path, 65, N + 120).startswith("ctx 65% (650k/1000k, +6%/turn, ~5 turns left) ·")
     assert _turn(tmp_path, 71, N + 180).startswith("ctx 71% (710k/1000k, +6%/turn, ~4 turns left) ·")
-    # mean over the last 3 turns only: 59,65,71,89 -> (6+6+18)/3 = 10
-    assert _turn(tmp_path, 89, N + 240).startswith("ctx 89% (890k/1000k, +10%/turn, ~1 turn left)(HIGH)")
+    # the larger of the 3-turn mean (59,65,71,89 -> 10) and the latest turn (18)
+    assert _turn(tmp_path, 89, N + 240).startswith("ctx 89% (890k/1000k, +18%/turn, ~1 turn left)(HIGH)")
 
 
 def test_turn_rate_only_when_it_says_something(tmp_path):
@@ -139,7 +139,8 @@ def test_compaction_resets_turns(tmp_path):
         _turn(tmp_path, p, N + 60 * i)
     assert _turn(tmp_path, 30, N + 200).startswith("ctx 30% (300k/1000k) ·")
     assert _turn(tmp_path, 36, N + 260).startswith("ctx 36% (360k/1000k) ·")
-    assert _turn(tmp_path, 62, N + 320).startswith("ctx 62% (620k/1000k, +16%/turn, ~3 turns left)")
+    # mean 16, latest turn 26: the latest leads, (95 - 62) / 26 rounds up to 2
+    assert _turn(tmp_path, 62, N + 320).startswith("ctx 62% (620k/1000k, +26%/turn, ~2 turns left)")
 
 
 def test_same_reading_not_a_turn_and_clock_backwards(tmp_path):
@@ -167,17 +168,20 @@ def test_junk_turns_file(tmp_path):
         assert _turn(tmp_path, 60, N).startswith("ctx 60% (600k/1000k) ·")
 
 
-# --- quota projection --------------------------------------------------------------
+# --- quota projection (0.12.0 fix round A: evidence rule, sparse 5-hour series, no 7-day projection) ---
 
-def _samples(*pts, key="five_pct"):
-    return [{"ts": int(t), "used_tokens": 1000 * i, "used_pct": 50, "five_pct": None, "seven_pct": None,
-             key: p} for i, (t, p) in enumerate(pts)]
+def _series(*pts):
+    return [{"ts": int(t), "pct": p} for t, p in pts]
 
 
-def _quota(sd, pct=62, reset=N + 3 * 3600, samples=None, now=N):
-    _put(sd, used_pct=40, used_tokens=400000, five_hour={"used_pct": pct, "resets_at": reset}, seven_day=None,
-         samples=samples if samples is not None else _samples((N - 1800, 50), (N - 900, 56), (N, 62)))
+def _quota(sd, pct=62, reset=N + 3 * 3600, series=None, now=N, ts=N):
+    _put(sd, ts=ts, used_pct=40, used_tokens=400000, five_hour={"used_pct": pct, "resets_at": reset},
+         seven_day=None,
+         five_series=series if series is not None else _series((N - 1800, 50), (N - 900, 56), (N, 62)))
     return soma_ctx.context_reading({"session_id": SID}, str(sd), now)
+
+
+PLAIN = "ctx 40% (400k/1000k) · 5h 62%"
 
 
 def test_projection_before_reset_and_flag(tmp_path):
@@ -188,45 +192,185 @@ def test_projection_before_reset_and_flag(tmp_path):
 
 def test_projection_after_reset_is_plain(tmp_path):
     r = _quota(tmp_path, reset=N + 3600)
-    assert r["seg"] == "ctx 40% (400k/1000k) · 5h 62%" and r["quota"] is False
+    assert r["seg"] == PLAIN and r["quota"] is False
 
 
 def test_projection_doubtful_cases_plain(tmp_path):
     cases = [
-        _samples((N - 300, 56), (N, 62)),                       # span under 10 min
-        _samples((N, 62)),                                      # one point
-        _samples((N - 1800, 50), (N - 900, 64), (N, 62)),       # not monotonic
-        _samples((N - 1800, 50), (N - 2000, 56), (N, 62)),      # timestamps out of order
-        _samples((N - 3 * 3600, 20), (N - 900, 56), (N, 62)),   # spans the previous reset
-        _samples((N - 1800, 62), (N, 62)),                      # flat
-        _samples((N - 1800, 50), (N - 900, 56), (N + 4000, 62)),  # a sample from the future
+        _series((N - 600, 56), (N, 62)),                        # span under 15 min
+        _series((N, 62)),                                       # one point
+        _series((N - 900, 58), (N - 450, 60), (N, 62)),         # under 5 points over the span
+        _series((N - 1800, 50), (N - 900, 64), (N, 62)),        # not monotonic
+        _series((N - 1800, 50), (N - 2000, 56), (N, 62)),       # timestamps out of order
+        _series((N - 3 * 3600, 20), (N - 900, 56), (N, 62)),    # spans the previous reset
+        _series((N - 1800, 62), (N, 62)),                       # flat
+        _series((N - 2400, 50), (N - 1300, 56), (N - 700, 62)),  # newest point 700 s old: stale
+        "junk", [{"ts": "x", "pct": 1}, None],
     ]
     for s in cases:
-        r = _quota(tmp_path, samples=s)
-        assert r["seg"] == "ctx 40% (400k/1000k) · 5h 62%" and r["quota"] is False, s
+        r = _quota(tmp_path, series=s)
+        assert r["seg"] == PLAIN and r["quota"] is False, s
     r = _quota(tmp_path, reset=None)
-    assert r["seg"] == "ctx 40% (400k/1000k) · 5h 62%" and r["quota"] is False
+    assert r["seg"] == PLAIN and r["quota"] is False
 
 
-def test_projection_below_half_has_no_flag(tmp_path):
-    r = _quota(tmp_path, pct=30, samples=_samples((N - 1800, 10), (N - 900, 20), (N, 30)))
-    assert "5h 30% (out ~" in r["seg"] and r["quota"] is False
+def test_projection_reading_from_the_future_is_plain(tmp_path):
+    s = _series((N - 1800, 50), (N - 900, 56), (N + 120, 62))
+    r = _quota(tmp_path, series=s, ts=N + 120)
+    assert r["seg"] == PLAIN and r["quota"] is False
+
+
+def test_projection_run_out_in_the_past_is_plain(tmp_path):
+    # 24 points per 30 min: the last point is used up 75 s after a reading 500 s old
+    s = _series((N - 2300, 75), (N - 500, 99))
+    r = _quota(tmp_path, pct=99, series=s, ts=N - 500)
+    assert r["seg"] == "ctx 40% (400k/1000k) · 5h 99%" and r["quota"] is False
+
+
+def test_projection_leans_on_a_recent_burst(tmp_path):
+    """Idle for 80 min, then 10 points in the last 30: the recent third sets the rate."""
+    s = _series((N - 6000, 50), (N - 3000, 50), (N - 1800, 50), (N - 900, 55), (N, 60))
+    r = _quota(tmp_path, pct=60, series=s)
+    # whole span: 10 points / 6000 s; recent third (2000 s, from N - 1800): 10 points / 1800 s
+    assert r["seg"] == f"ctx 40% (400k/1000k) · 5h 60% (out ~{_hm(N + 7200)}, resets {_hm(N + 3 * 3600)})"
+    s = _series((N - 6000, 50), (N - 1800, 53), (N, 55))  # recent third rises only 2: whole span
+    r = _quota(tmp_path, pct=55, series=s)
+    assert "5h 55%" in r["seg"] and "out ~" not in r["seg"]  # 5 / 6000 s: out after the reset
+
+
+def test_quota_flag_threshold(tmp_path):
+    for pct, flag in ((49, False), (50, True), (51, True)):
+        s = _series((N - 1800, pct - 12), (N - 900, pct - 6), (N, pct))
+        r = _quota(tmp_path / str(pct), pct=pct, series=s)
+        assert f"5h {pct}% (out ~" in r["seg"] and r["quota"] is flag, pct
 
 
 def test_quota_off_switch(tmp_path, monkeypatch):
     monkeypatch.setenv("SOMA_QUOTA", "0")
     r = _quota(tmp_path)
-    assert r["seg"] == "ctx 40% (400k/1000k) · 5h 62%" and r["quota"] is False
+    assert r["seg"] == PLAIN and r["quota"] is False
 
 
-def test_projection_seven_day_weekday(tmp_path):
-    reset = N + 4 * 86400
+def test_seven_day_never_projects(tmp_path):
+    """Replaces the 0.12.0 7-day weekday projection: whole percentages over minutes are noise."""
+    reset = N + 3 * 3600  # 3 h before its reset, with a series that would project for a 5-hour window
     _put(tmp_path, used_pct=40, used_tokens=400000, five_hour=None, seven_day={"used_pct": 70, "resets_at": reset},
-         samples=_samples((N - 86400, 40), (N - 43200, 55), (N, 70), key="seven_pct"))
+         samples=[{"ts": int(N - 86400), "used_tokens": 1, "seven_pct": 40},
+                  {"ts": int(N), "used_tokens": 2, "seven_pct": 70}],
+         five_series=_series((N - 1800, 50), (N, 70)))
     r = soma_ctx.context_reading({"session_id": SID}, str(tmp_path), N)
-    out = N + 86400  # 30 points per day, 30 left
-    w = lambda t: DAYS[time.localtime(t).tm_wday] + " " + _hm(t)  # noqa: E731
-    assert r["seg"] == f"ctx 40% (400k/1000k) · 7d 70% (out ~{w(out)}, resets {w(reset)})" and r["quota"]
+    assert r["seg"] == "ctx 40% (400k/1000k) · 7d 70%" and r["quota"] is False
+
+
+def _rl_doc(five=None, fr=None, seven=None, sr=None):
+    rl = {}
+    if five is not None:
+        rl["five_hour"] = {"used_percentage": five, "resets_at": fr}
+    if seven is not None:
+        rl["seven_day"] = {"used_percentage": seven, "resets_at": sr}
+    return {"session_id": SID, "rate_limits": rl,
+            "context_window": {"used_percentage": 40, "context_window_size": 1000000,
+                               "current_usage": {"input_tokens": 400000}}}
+
+
+def _simulate(sd, minutes, step, pct_at, **win):
+    """One statusline write and one prompt every `step` seconds; returns [(t, reading)]."""
+    out = []
+    for t in range(0, minutes * 60 + 1, step):
+        now = N + t
+        doc = _rl_doc(**{k: (pct_at(t) if v is True else v) for k, v in win.items()})
+        soma_ctx.write_from_statusline(doc, str(sd), now)
+        out.append((t, soma_ctx.context_reading({"session_id": SID}, str(sd), now + 1)))
+    return out
+
+
+def test_series_one_point_per_300s_and_reset(tmp_path):
+    for t, p in ((0, 50), (100, 51), (299, 52), (300, 53), (650, 54)):
+        soma_ctx.write_from_statusline(_rl_doc(five=p, fr=N + 9000), str(tmp_path), N + t)
+    assert _ctxfile(tmp_path)["five_series"] == _series((N, 50), (N + 300, 53), (N + 650, 54))
+    soma_ctx.write_from_statusline(_rl_doc(five=54, fr=N + 9999), str(tmp_path), N + 1000)  # resets_at moved
+    assert _ctxfile(tmp_path)["five_series"] == _series((N + 1000, 54))
+    soma_ctx.write_from_statusline(_rl_doc(five=3, fr=N + 9999), str(tmp_path), N + 1400)  # pct fell
+    assert _ctxfile(tmp_path)["five_series"] == _series((N + 1400, 3))
+    for i in range(40):
+        soma_ctx.write_from_statusline(_rl_doc(five=3 + i, fr=N + 99999), str(tmp_path), N + 2000 + 300 * i)
+    assert len(_ctxfile(tmp_path)["five_series"]) == 24
+
+
+def test_sim_steady_fast_burn_projects_once_then_stays(tmp_path):
+    """12 points/hour from 60 %, 5-hour window resets 4 h on, a prompt a minute for 90 min."""
+    reset = N + 4 * 3600
+    res = _simulate(tmp_path, 90, 60, lambda t: int(60 + 12 * t / 3600), five=True, fr=reset)
+    shown = [("out ~" in r["seg"], r["quota"]) for _, r in res]
+    first = shown.index((True, True))
+    assert all(s == (False, False) for s in shown[:first])
+    assert all(s == (True, True) for s in shown[first:]), shown
+    assert 15 <= res[first][0] / 60 <= 40
+    true_out = N + 40 / 12 * 3600
+    for t, r in res[first:]:
+        hm = r["seg"].split("out ~")[1][:5]
+        outs = [x for x in range(int(true_out) - 3600, int(true_out) + 900, 60) if _hm(x) == hm]
+        assert outs, (t, r["seg"])  # within an hour early and 15 min late of the true run-out
+
+
+def test_sim_seven_day_steady_never_projects(tmp_path):
+    """The p4/p4b shape: 7-day at 1 point/hour (and at 12/hour), prompts every 2 min for 4 hours."""
+    for rate in (1, 12):
+        sd = tmp_path / str(rate)
+        res = _simulate(sd, 240, 120, lambda t: int(55 + rate * t / 3600), seven=True, sr=N + 72 * 3600)
+        assert not any("out ~" in r["seg"] or r["quota"] for _, r in res)
+
+
+def test_sim_slow_five_hour_never_projects(tmp_path):
+    """5-hour at 1 point/hour from 85, reset 4 h on: whole-percent steps are not a rate."""
+    res = _simulate(tmp_path, 230, 60, lambda t: int(85 + t / 3600), five=True, fr=N + 4 * 3600)
+    assert not any("out ~" in r["seg"] or r["quota"] for _, r in res)
+
+
+# --- turns left: honest rate (0.12.0 fix round A) ---------------------------------
+
+def _turnf(sd, fill, ts):
+    _put(sd, ts=ts, used_pct=int(fill), used_tokens=round(fill * 10000))
+    return _seg(sd, now=ts + 1)[0]
+
+
+def _turns(sd, *fills):
+    for i, f in enumerate(fills):
+        seg = _turnf(sd, f, N + 60 * i)
+    return seg
+
+
+def test_equal_fill_is_not_a_turn(tmp_path):
+    seg = _turns(tmp_path, 80, 80, 80, 86)  # one real turn, not three flat ones and a jump
+    assert seg.startswith("ctx 86% (860k/1000k)") and "turn" not in seg
+
+
+def test_latest_turn_outweighs_a_small_mean(tmp_path):
+    seg = _turns(tmp_path, 60, 60.1, 60.2, 72)  # mean 4, latest 11.8: the latest sets the rate
+    assert "+12%/turn, ~2 turns left" in seg, seg
+
+
+def test_turns_left_rounding(tmp_path):
+    seg = _turns(tmp_path, 91, 91.4, 91.8)  # 3.2 / 0.4 is 8, not 8.000000000000002
+    assert "+<1%/turn, ~8 turns left" in seg, seg
+
+
+def test_ten_turn_boundary(tmp_path):
+    for fills, want in (((84, 85, 86), "~9 turns left"), ((83, 84, 85), "~10 turns left"),
+                        ((82, 83, 84), None), ((92, 92.3, 92.6), "~8 turns left")):
+        seg = _turns(tmp_path / str(fills), *fills)
+        assert (want in seg) if want else "turn" not in seg, (fills, seg)
+    seg = _turns(tmp_path / "r", 92, 92.1, 92.2, 92.3)  # (95 - 92.3) / 0.1 rounds to 27: too far
+    assert "turn" not in seg, seg
+    seg = _turns(tmp_path / "p", 91.4, 91.7, 92.0)  # raw 10.000000000000094: the limit sees the rounded 10
+    assert "+<1%/turn, ~10 turns left" in seg, seg
+    seg = _turns(tmp_path / "q", 91.7, 92.0, 92.3)  # 2.7 / 0.3 rounds to 9, raw is 9.000000000000085
+    assert "~9 turns left" in seg, seg
+
+
+def test_fill_exactly_at_full_pct(tmp_path):
+    seg = _turns(tmp_path, 85, 90, 95)
+    assert seg.startswith("ctx 95% (950k/1000k)(HIGH)") and "turn" not in seg, seg
 
 
 # --- cost ----------------------------------------------------------------------------
@@ -337,13 +481,6 @@ def test_compaction_inside_a_turn_resets(tmp_path):
     assert _seg(sd, now=N + 181)[0].startswith("ctx 71% (710k/1000k) ·")
 
 
-def test_projection_counts_quiet_time_since_last_sample(tmp_path):
-    """No change for 50 min since the last sample: over the whole span it no longer runs out."""
-    s = _samples((N - 3600, 50), (N - 3000, 56))  # alone: out ~N+1400, before the reset
-    r = _quota(tmp_path, pct=56, reset=N + 1800, samples=s)
-    assert r["seg"] == "ctx 40% (400k/1000k) · 5h 56%" and r["quota"] is False
-
-
 def test_pulse_takes_model_notice_only_when_told_state_written(tmp_path, monkeypatch):
     sd = tmp_path / "state"
     soma_ctx.write_from_statusline(_sl(30, model="m-a"), str(sd), N - 600)
@@ -362,6 +499,7 @@ def test_second_session_and_old_change_and_clock(tmp_path):
     soma_ctx.write_from_statusline(_sl(30, model="m-b", sid=other), str(sd), N - 60)
     assert soma_ctx.take_model_notice(other, str(sd), N) is None   # its own file: no change there
     assert soma_ctx.take_model_notice(SID, str(sd), N - 3600) is None  # change "after" now: clock went back
+    assert soma_ctx.take_model_notice(SID, str(sd), N - 120) is None  # 60 s ahead: the file reads, the change is future
     assert soma_ctx.take_model_notice(SID, str(sd), N + 2 * 86400) is None  # older than a day (and stale)
     assert soma_ctx.take_model_notice(SID, str(sd), N) is not None
     assert soma_ctx.take_model_notice(SID, str(sd), N) is None
@@ -386,3 +524,25 @@ def test_off_switch_ctx_silences_new_parts(tmp_path, monkeypatch):
     monkeypatch.setenv("SOMA_CTX", "off")
     assert soma_ctx.take_model_notice(SID, str(sd), N) is None
     assert _prompt(tmp_path, N) is None
+
+
+def test_model_notice_names_the_model_the_session_was_told(tmp_path):
+    """B -> C -> D before a prompt: the session never heard of C, so the notice says B."""
+    sd = str(tmp_path)
+    for i, m in enumerate(("m-b", "m-c", "m-d")):
+        soma_ctx.write_from_statusline(_sl(30 + i, model=m), sd, N + 10 * i)
+    assert soma_ctx.take_model_notice(SID, sd, N + 30) == f"model m-d (was m-b until {_hm(N + 20)})"
+    assert soma_ctx.take_model_notice(SID, sd, N + 31) is None
+
+
+def test_model_notice_away_and_back(tmp_path):
+    sd = str(tmp_path)
+    soma_ctx.write_from_statusline(_sl(30, model="m-a"), sd, N)
+    soma_ctx.write_from_statusline(_sl(31, model="m-b"), sd, N + 5)
+    soma_ctx.write_from_statusline(_sl(32, model="m-a"), sd, N + 5)  # back within the same second
+    assert soma_ctx.take_model_notice(SID, sd, N + 6) is None  # still the model it was told
+    soma_ctx.write_from_statusline(_sl(33, model="m-b"), sd, N + 9)
+    assert soma_ctx.take_model_notice(SID, sd, N + 10) == f"model m-b (was m-a until {_hm(N + 9)})"
+    soma_ctx.write_from_statusline(_sl(34, model="m-a"), sd, N + 9)  # and back, same second again
+    assert soma_ctx.take_model_notice(SID, sd, N + 10) == f"model m-a (was m-b until {_hm(N + 9)})"
+    assert soma_ctx.take_model_notice(SID, sd, N + 11) is None
