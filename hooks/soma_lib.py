@@ -81,7 +81,8 @@ except Exception:
 try:
     from soma_work import work_reading
 except Exception:
-    def work_reading(hook_input, table, proc_root="/proc", sdir=None, now=None, pulse=False, self_pid=None):
+    def work_reading(hook_input, table, proc_root="/proc", sdir=None, now=None, pulse=False, self_pid=None,
+                     net=None):
         return {"segs": [], "force": False, "flags": set()}
 
 
@@ -89,8 +90,8 @@ except Exception:
 try:
     from soma_host import host_reading
 except Exception:
-    def host_reading(proc_root, table, record, now):
-        return {"stale": [], "record": {}, "pkg": None, "reboot": False}
+    def host_reading(proc_root, table, record, now, stamps=None, stamp=None):
+        return {"stale": [], "record": {}, "stamps": {}, "net": [], "pkg": None, "reboot": False}
 
 PULSE_SUBDIR = "soma-pulse"
 
@@ -872,7 +873,7 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     # each is marked announced before it is printed, so it is said once and only if recorded
     compact_seg = _take_compact_notice(sid, state_dir, now) if sid and not subagent else None
     model_seg = _take_model_notice(sid, state_dir, now) if sid and not subagent else None
-    work = (work_reading(hook_input, state.get("_procs"), proc_root, state_dir, now)
+    work = (work_reading(hook_input, state.get("_procs"), proc_root, state_dir, now, net=state.get("_net"))
             if hook_input else {"segs": [], "force": False, "flags": set()})
     line = None
     if mode == "always" or a["flags"] or ctx_high or quota or compact_seg or model_seg or work["force"]:
@@ -1020,10 +1021,19 @@ def _sample(proc_root, mounts, services, hwmon_root, sys_root, state_dir, now):
     doc = roll_state(prev, state, now)
     _carry_pulse_held(prev, doc)
     # host preconditions: the stale-mount back-off lives in the host-wide state
-    host = host_reading(proc_root, state.get("_procs"), prev.get("stale"), now)
+    def stamp(stamps):  # the probe attempt is on disk BEFORE the probe, for parallel sessions
+        fresh = load_state(state_dir)
+        fresh["net_probe"] = dict(stamps)
+        save_state(fresh, state_dir)
+
+    host = host_reading(proc_root, state.get("_procs"), prev.get("stale"), now,
+                        prev.get("net_probe"), stamp)
     state["stale"], state["pkg"], state["reboot"] = host["stale"], host["pkg"], host["reboot"]
+    state["_net"] = list(host.get("net") or []) + list(host["stale"])
     if host["record"]:
         doc["stale"] = host["record"]
+    if host.get("stamps"):
+        doc["net_probe"] = host["stamps"]
     return state, prev, host_events, trends, doc
 
 
@@ -1084,7 +1094,8 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
         # told-state was written, so a line that will not print never consumes it
         compact_seg = _take_compact_notice(sid, state_dir, now) if told else None
         model_seg = _take_model_notice(sid, state_dir, now) if told else None
-        work = (work_reading(hook_input, state.get("_procs"), proc_root, state_dir, now, pulse=True)
+        work = (work_reading(hook_input, state.get("_procs"), proc_root, state_dir, now, pulse=True,
+                                net=state.get("_net"))
                 if told else work)
     else:
         appeared, recovered, new_held = pulse_transition(_seed_held(prev), a["flags"], now, hold_s)

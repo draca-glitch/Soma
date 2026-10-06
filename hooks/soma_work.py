@@ -10,21 +10,32 @@ of the session's cwd (read directly, no subprocess):
     A session root is a process whose comm is in SOMA_PEER_COMM (default
     claude) with no such process among its ancestors, not a zombie and not
     stopped. This session's own root is the topmost one above the hook, so its
-    headless children are never peers; a peer's headless children are not
-    separate sessions either. An unreadable cwd counts as a session elsewhere.
+    headless children are never peers, nor is a detached one reparented to init
+    (its environment's CLAUDE_PID equals this session's root pid); a peer's headless
+    children are not separate sessions either. An unreadable cwd counts as a session
+    elsewhere. The payload cwd is resolved (symlinks) before comparing.
   - HEAD: the ref HEAD points at (branch name, or the first 7 characters of a
     detached hash), per session. A change against the session's record is said
     once; a commit on the same branch is not a change. In the pulse, a Bash
-    command mentioning git is the agent's own doing and is recorded silently.
+    command with git as a command word is the agent's own doing and is recorded
+    silently. An unreadable or empty HEAD keeps the last good record. Only regular
+    files are opened (O_NONBLOCK, so a FIFO cannot hang the hook).
   - leftovers (bg): processes this session started through the Bash tool that
-    still run SOMA_BG_AGE_S (600) after they started. The discriminator is the
-    CLAUDE_PID variable the harness puts in the Bash tool's environment (and
-    only there: MCP servers, hooks and the statusline do not carry it) equal to
-    the session root's pid, with a start time after the root's (pid reuse).
-    Only processes under the session root or reparented to init are looked at.
+    still run SOMA_BG_AGE_S (600) after they started. The discriminator is
+    CLAUDE_PID equal to the session root's pid without CLAUDE_PROJECT_DIR (measured:
+    Bash-tool shells, hook and statusline commands all carry CLAUDE_PID, MCP servers do
+    not; only the hook and statusline children carry CLAUDE_PROJECT_DIR), with a start
+    time after the root's (pid reuse). Looked at: the root's subtree and processes
+    reparented to PID 1 or to a parent named systemd.
     It is a heuristic: it never forces a line and raises no flag.
 
-State: <state_dir>/soma-work/<sid>.json {ts, top, head, peers}. A said-once
+Network mounts: no path under a network mount (soma_host's fstypes, from
+/proc/mounts) or a mount recorded stale is ever touched, decided by string
+comparison: HEAD and peers are silent for such a cwd, a peer there is elsewhere.
+The cwd's toplevel is walked once per cwd (again after REWALK_S) and kept in the
+record as `where`; every walk is bounded to MAX_LEVELS.
+
+State: <state_dir>/soma-work/<sid>.json {ts, top, head, peers, where}. A said-once
 item (HEAD moved, peers appearing) is claimed through an exclusive file keyed
 on the record it changes, and returned only when the new record was written.
 A subagent's call reads and writes nothing. Never raises. Pure stdlib.
@@ -32,6 +43,8 @@ Used by soma_lib.line_for_mode and soma_lib.pulse_line.
 """
 
 import os
+import re
+import stat
 import time
 
 try:
@@ -54,6 +67,10 @@ OFF_VALUES = ("0", "off", "false", "no")
 SHELLS = {"bash", "sh", "dash", "zsh", "fish"}
 CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 MARKER = b"CLAUDE_PID="
+HOOK_MARK = b"\0CLAUDE_PROJECT_DIR="  # hook and statusline children carry it, Bash-tool shells do not
+MAX_LEVELS = 40
+REWALK_S = 60.0
+GIT_WORD = re.compile(r"(?:^|[;&|(\s])git(?:\s|$)")
 
 
 def _on(name: str) -> bool:
@@ -71,25 +88,96 @@ def _names() -> set:
 
 # ---- git ---------------------------------------------------------------------------------
 
-def _git_dir(top: str) -> str | None:
-    dot = os.path.join(top, ".git")
-    if os.path.isdir(dot):
-        return dot
+def under(path, net) -> bool:
+    """path is at or below one of the mount points in net: string comparison only, never a stat."""
+    if not isinstance(path, str) or not net:
+        return False
+    for m in net:
+        if isinstance(m, str) and m:
+            m = m.rstrip("/") or "/"
+            if path == m or path.startswith(m if m == "/" else m + "/"):
+                return True
+    return False
+
+
+def _read_regular(path: str) -> str | None:
+    """The first 4 KiB of path when it is a regular file. O_NONBLOCK so a FIFO put there
+    cannot hang the open; anything but a regular file reads as None."""
     try:
-        with open(dot) as f:
-            line = f.read(4096).strip()
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return None
-    if not line.startswith("gitdir:"):
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, 4096).decode("utf-8", "replace")
+    except OSError:
         return None
-    path = line[len("gitdir:"):].strip()
+    finally:
+        os.close(fd)
+
+
+def _git_dir(top: str) -> str | None:
+    dot = os.path.join(top, ".git")
+    try:
+        st = os.stat(dot)
+    except OSError:
+        return None
+    if stat.S_ISDIR(st.st_mode):
+        return dot
+    line = _read_regular(dot) if stat.S_ISREG(st.st_mode) else None
+    if not line or not line.strip().startswith("gitdir:"):
+        return None
+    path = line.strip()[len("gitdir:"):].strip()
     return os.path.normpath(os.path.join(top, path))
 
 
-def toplevel(cwd: str) -> str | None:
-    """The nearest directory at or above cwd holding a .git entry, or None."""
-    path = os.path.abspath(cwd)
-    for _ in range(64):
+def resolve(path, net=()) -> str | None:
+    """realpath without ever touching a path under a mount in net: component by component, each
+    checked by string before its lstat, at most MAX_LEVELS symlinks. None when it would cross
+    into such a mount or cannot be resolved."""
+    if not isinstance(path, str) or not os.path.isabs(path) or under(path, net):
+        return None
+    parts, done, links, steps = [p for p in path.split("/") if p], "/", 0, 0
+    while parts:
+        steps += 1
+        if steps > 4096:
+            return None
+        p = parts.pop(0)
+        if p == ".":
+            continue
+        if p == "..":
+            done = os.path.dirname(done)
+            continue
+        cand = os.path.join(done, p)
+        if under(cand, net):
+            return None
+        try:
+            st = os.lstat(cand)
+            if stat.S_ISLNK(st.st_mode):
+                links += 1
+                if links > MAX_LEVELS:
+                    return None
+                target = os.readlink(cand)
+                parts = [x for x in target.split("/") if x] + parts
+                if target.startswith("/"):
+                    done = "/"
+                continue
+        except OSError:
+            return None
+        done = cand
+    return done
+
+
+def toplevel(cwd: str, net=()) -> str | None:
+    """The nearest directory at or above cwd holding a .git entry, or None; at most MAX_LEVELS
+    levels, and None at the first level under a mount in net (never stat'ed)."""
+    path = os.path.normpath(cwd) if isinstance(cwd, str) else None
+    if not path or not os.path.isabs(path):
+        return None
+    for _ in range(MAX_LEVELS):
+        if under(path, net):
+            return None
         if os.path.lexists(os.path.join(path, ".git")):
             return path
         parent = os.path.dirname(path)
@@ -99,18 +187,13 @@ def toplevel(cwd: str) -> str | None:
     return None
 
 
-def git_head(cwd) -> tuple | None:
-    """(toplevel, ref) for cwd: the branch HEAD points at (refs/heads/ stripped), or the first
-    7 characters of a detached hash. None without a readable git directory."""
+def head_ref(top: str) -> str | None:
+    """The branch HEAD points at (refs/heads/ stripped), or the first 7 characters of a detached
+    hash; None when HEAD is missing, empty, not a regular file or unparseable."""
     try:
-        if not isinstance(cwd, str) or not os.path.isabs(cwd):
-            return None
-        top = toplevel(cwd)
-        gd = _git_dir(top) if top else None
-        if not gd:
-            return None
-        with open(os.path.join(gd, "HEAD")) as f:
-            head = f.read(4096).strip()
+        gd = _git_dir(top)
+        head = _read_regular(os.path.join(gd, "HEAD")) if gd else None
+        head = head.strip() if head else ""
         if head.startswith("ref:"):
             ref = head[4:].strip()
             ref = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
@@ -118,6 +201,17 @@ def git_head(cwd) -> tuple | None:
             ref = head[:7]
         else:
             return None
+        return ref or None
+    except Exception:
+        return None
+
+
+def git_head(cwd, net=()) -> tuple | None:
+    """(toplevel, ref) for cwd, None without a readable git directory or under a mount in net."""
+    try:
+        real = resolve(cwd, net)
+        top = toplevel(real, net) if real else None
+        ref = head_ref(top) if top else None
         return (top, ref) if ref else None
     except Exception:
         return None
@@ -141,31 +235,46 @@ def _cwd(proc_root: str, pid: int) -> str | None:
         return None
 
 
-def peers(table: dict, proc_root: str, self_pid: int, cwd) -> dict | None:
+def peers(table: dict, proc_root: str, self_pid: int, cwd, net=(), mine=None) -> dict | None:
     """{here, total}: live session roots elsewhere in the same place as this session, and all
-    live sessions including this one. None when the hook is not under a session root."""
+    live sessions including this one. None when the hook is not under a session root, or when
+    this session's cwd is under a mount in net. A candidate whose environment carries CLAUDE_PID
+    equal to this session's root is this session's own detached child, not a peer. A peer whose
+    cwd is under a mount in net counts as elsewhere, untouched. mine: a callable returning this
+    cwd's toplevel (cached by the caller), called only when there is a candidate."""
     names = _names()
     chain = _ancestors(table, self_pid)
     own = [p for p in chain if table[p].get("comm") in names]
     if not own:
         return None
     own_root = own[-1]
-    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+    if isinstance(cwd, str) and os.path.isabs(cwd):
+        cwd = resolve(cwd, net)
+    else:
         cwd = _cwd(proc_root, own_root)
-        if not cwd:
-            return None
-    mine = toplevel(cwd)
-    here, total = 0, 1
+        cwd = None if under(cwd, net) else cwd
+    if not cwd:
+        return None
+    value = str(own_root).encode()
+    cands = []
     for pid, e in table.items():
         if pid == own_root or e.get("comm") not in names or e.get("state") in ("Z", "T", "t", "X", "x"):
             continue
         if any(table[a].get("comm") in names for a in _ancestors(table, e.get("ppid"))):
             continue
-        total += 1
+        env = _environ(proc_root, pid)
+        if env is not None and (b"\0" + env).find(b"\0" + MARKER + value + b"\0") >= 0:
+            continue  # this session's own `claude -p`, reparented once its shell exited
+        cands.append(pid)
+    here, total = 0, 1 + len(cands)
+    if not cands:
+        return {"here": 0, "total": total}
+    top = mine() if callable(mine) else toplevel(cwd, net)
+    for pid in cands:
         pc = _cwd(proc_root, pid)
-        if pc is None:
+        if pc is None or under(pc, net):
             continue
-        if (toplevel(pc) == mine) if mine else (os.path.normpath(pc) == os.path.normpath(cwd)):
+        if (toplevel(pc, net) == top) if top else (os.path.normpath(pc) == os.path.normpath(cwd)):
             here += 1
     return {"here": here, "total": total}
 
@@ -178,13 +287,22 @@ def _uptime(proc_root: str) -> float | None:
         return None
 
 
-def _marked(proc_root: str, pid: int, value: bytes) -> bool:
+def _environ(proc_root: str, pid: int) -> bytes | None:
     try:
         with open(os.path.join(proc_root, str(pid), "environ"), "rb") as f:
-            env = f.read(262144)
+            return f.read(262144)
     except OSError:
+        return None
+
+
+def _marked(proc_root: str, pid: int, value: bytes) -> bool:
+    """CLAUDE_PID=<root> without CLAUDE_PROJECT_DIR: a Bash-tool process, not a hook or
+    statusline child (those carry both)."""
+    env = _environ(proc_root, pid)
+    if env is None:
         return False
-    return (b"\0" + env).find(b"\0" + MARKER + value + b"\0") >= 0
+    env = b"\0" + env
+    return env.find(b"\0" + MARKER + value + b"\0") >= 0 and env.find(HOOK_MARK) < 0
 
 
 def leftovers(table: dict, proc_root: str, self_pid: int, min_age: float) -> dict | None:
@@ -271,10 +389,25 @@ def _str(v):
     return v if isinstance(v, str) and v else None
 
 
+def _where(prev: dict, cwd, net, now) -> dict:
+    """{cwd, real, top, ts}: the payload cwd resolved and its toplevel, from the session record
+    when it is for the same cwd and younger than REWALK_S (a new `git init` is found within that),
+    else walked now. A cwd under a mount in net is never walked: real and top are None."""
+    w = prev.get("where")
+    if isinstance(w, dict) and w.get("cwd") == cwd and isinstance(w.get("ts"), (int, float)) \
+            and not isinstance(w.get("ts"), bool) and 0 <= now - w["ts"] < REWALK_S \
+            and not under(w.get("real"), net):
+        return {"cwd": cwd, "real": _str(w.get("real")), "top": _str(w.get("top")), "ts": w["ts"]}
+    real = resolve(cwd, net) if cwd else None
+    return {"cwd": cwd, "real": real, "top": toplevel(real, net) if real else None, "ts": now}
+
+
 def work_reading(hook_input, table, proc_root: str = "/proc", sdir=None, now=None,
-                 pulse: bool = False, self_pid: int | None = None) -> dict:
+                 pulse: bool = False, self_pid: int | None = None, net=None) -> dict:
     """{segs, force, flags} for this session: segments to append in order (HEAD moved, peers,
-    bg), whether one of them must force the line (a said-once item), and its log flags."""
+    bg), whether one of them must force the line (a said-once item), and its log flags.
+    net: the network and stale mount points this run already knows; no path under them is
+    touched (None: read the network mounts from proc_root/mounts, no stat)."""
     out = {"segs": [], "force": False, "flags": set()}
     try:
         if not isinstance(hook_input, dict) or hook_input.get("agent_id"):
@@ -284,38 +417,60 @@ def work_reading(hook_input, table, proc_root: str = "/proc", sdir=None, now=Non
             return out
         now = time.time() if now is None else now
         self_pid = _self_pid() if self_pid is None else self_pid
+        if net is None:
+            try:
+                from soma_host import net_mount_table
+                net = [mp for _, mp in net_mount_table(proc_root)]
+            except Exception:
+                net = []
+        net = [m for m in net if isinstance(m, str) and m]
         cwd = hook_input.get("cwd")
-        cwd = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+        cwd = os.path.normpath(cwd) if isinstance(cwd, str) and os.path.isabs(cwd) else None
         table = table if isinstance(table, dict) else {}
         prev = _read(sdir, sid)
         new = {"ts": now, "top": _str(prev.get("top")), "head": _str(prev.get("head"))}
         p_told = prev.get("peers") if isinstance(prev.get("peers"), int) and not isinstance(prev.get("peers"), bool) \
             and prev["peers"] >= 0 else 0
         new["peers"] = p_told
+        old_where = prev.get("where") if isinstance(prev.get("where"), dict) else None
+        where = None
+
+        def mine():
+            nonlocal where
+            if where is None:
+                where = _where(prev, cwd, net, now) if cwd else {"cwd": None, "real": None, "top": None, "ts": now}
+            return where["top"]
         head_seg = peer_seg = None
         peer_new = False
-        if _on("SOMA_HEAD") and cwd:
-            g = git_head(cwd)
-            top, ref = g if g else (None, None)
-            if top and top == new["top"] and new["head"] and ref != new["head"]:
-                cmd = hook_input.get("tool_input", {}).get("command") if isinstance(hook_input.get("tool_input"), dict) else None
-                own = pulse and hook_input.get("tool_name") == "Bash" and isinstance(cmd, str) and "git" in cmd
-                if not own:
-                    head_seg = f"HEAD {new['head']}→{ref} since last {'tool call' if pulse else 'prompt'}"
-            new["top"], new["head"] = top, ref
-        if _on("SOMA_PEERS") and table:
-            pr = peers(table, proc_root, self_pid, cwd)
+        if _on("SOMA_HEAD") and cwd and not under(cwd, net):
+            top = mine()
+            ref = head_ref(top) if top else None
+            if top and ref is None:
+                pass  # HEAD unreadable or half-written: keep the last good record, say nothing
+            else:
+                if top and top == new["top"] and new["head"] and ref != new["head"]:
+                    ti = hook_input.get("tool_input")
+                    cmd = ti.get("command") if isinstance(ti, dict) else None
+                    own = pulse and hook_input.get("tool_name") == "Bash" and isinstance(cmd, str) \
+                        and GIT_WORD.search(cmd) is not None
+                    if not own:
+                        head_seg = f"HEAD {new['head']}→{ref} since last {'tool call' if pulse else 'prompt'}"
+                new["top"], new["head"] = top, ref
+        if _on("SOMA_PEERS") and table and not (cwd and under(cwd, net)):
+            pr = peers(table, proc_root, self_pid, (where or {}).get("real") or cwd, net,
+                       mine if cwd else None)
             if pr is not None:
                 new["peers"] = pr["here"]
                 if pr["here"] > 0:
                     peer_seg = f"peers {pr['here']} here ({pr['total']} sessions)"
                     peer_new = p_told == 0
+        new["where"] = where if where is not None else old_where
         claim = _claim(sdir, sid, prev.get("ts")) if head_seg or peer_new else None
         if (head_seg or peer_new) and not claim:
             head_seg, peer_new = None, False  # another caller is saying it; this one stays quiet
             peer_seg = peer_seg if p_told else None
             return {"segs": [s for s in (peer_seg,) if s], "force": False, "flags": set()}
-        same = all(prev.get(k) == new[k] for k in ("top", "head", "peers")) and \
+        same = all(prev.get(k) == new[k] for k in ("top", "head", "peers", "where")) and \
             isinstance(prev.get("ts"), (int, float)) and not isinstance(prev.get("ts"), bool)
         # an unchanged record is not rewritten (one write saved per tool call); a change always is,
         # so the claim key (the record's ts) moves on with every said-once item

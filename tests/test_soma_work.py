@@ -386,3 +386,186 @@ def test_pulse_line_says_foreign_head_once_and_absorbs_own(tmp_path, monkeypatch
     own = dict(hi, tool_name="Bash", tool_input={"command": "git switch main"})
     assert soma_lib.pulse_line(now=5030.0, hook_input=own, hold_s=0, **kw) is None
     assert soma_lib.line_for_mode("pressure", now=5040.0, hook_input=hi, **kw) is None
+
+
+# ---- 0.12.0 pre-release fixes: no walk on a network mount, cache, own children, FIFOs ----------
+
+import builtins  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+def _record_fs(monkeypatch):
+    seen = []
+    for name in ("stat", "lstat", "open", "readlink", "listdir", "scandir", "statvfs", "access"):
+        real = getattr(os, name)
+
+        def wrap(*a, _real=real, **k):
+            if a and isinstance(a[0], (str, bytes, os.PathLike)):
+                seen.append(os.fsdecode(a[0]))
+            return _real(*a, **k)
+        monkeypatch.setattr(os, name, wrap)
+    real_open = builtins.open
+
+    def bopen(f, *a, **k):
+        if isinstance(f, (str, bytes, os.PathLike)):
+            seen.append(os.fsdecode(f))
+        return real_open(f, *a, **k)
+    monkeypatch.setattr(builtins, "open", bopen)
+    return seen
+
+
+def test_no_os_call_touches_a_path_under_a_network_mount(tmp_path, monkeypatch):
+    nas = tmp_path / "nas"
+    repo = _git(nas / "share" / "repo")
+    local = _git(tmp_path / "local")
+    procs = _base(repo, None) + [(300, 1, "claude", ROOT_START + 5, str(repo), None)]
+    root = _proc(tmp_path, procs)
+    table = soma_lib.proc_table(root)
+    seen = _record_fs(monkeypatch)
+    for cwd in (str(repo), str(local)):
+        out = soma_work.work_reading({"session_id": "s1", "cwd": cwd}, table, proc_root=root,
+                                     sdir=str(tmp_path / "st"), now=5000.0, self_pid=901, net=[str(nas)])
+        assert not any("HEAD" in s for s in out["segs"])
+        assert not any(s.startswith("peers") for s in out["segs"])
+    assert [p for p in seen if p == str(nas) or p.startswith(str(nas) + "/")] == []
+
+
+def test_a_stale_local_mount_is_also_untouched(tmp_path, monkeypatch):
+    repo = _git(tmp_path / "m" / "repo")
+    root = _proc(tmp_path, _base(repo, None))
+    table = soma_lib.proc_table(root)
+    seen = _record_fs(monkeypatch)
+    soma_work.work_reading({"session_id": "s1", "cwd": str(repo)}, table, proc_root=root,
+                           sdir=str(tmp_path / "st"), now=5000.0, self_pid=901, net=[str(tmp_path / "m")])
+    assert [p for p in seen if p.startswith(str(tmp_path / "m"))] == []
+
+
+def test_toplevel_walked_once_per_cwd_then_every_60s(tmp_path, monkeypatch):
+    repo = _git(tmp_path / "repo")
+    sub = repo / "a"
+    sub.mkdir()
+    root = _proc(tmp_path, _base(repo, None))
+    calls = []
+    real = soma_work.toplevel
+    monkeypatch.setattr(soma_work, "toplevel", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
+    for i in range(10):
+        _reading(root, repo, tmp_path / "st", now=5000.0 + i)
+    assert len(calls) == 1
+    _reading(root, sub, tmp_path / "st", now=5011.0)
+    assert len(calls) == 2
+    _reading(root, sub, tmp_path / "st", now=5072.0)
+    assert len(calls) == 3
+
+
+def test_mine_not_computed_without_a_candidate_peer(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOMA_HEAD", "0")
+    repo = _git(tmp_path / "repo")
+    root = _proc(tmp_path, _base(repo, None))
+    calls = []
+    real = soma_work.toplevel
+    monkeypatch.setattr(soma_work, "toplevel", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
+    _reading(root, repo, tmp_path / "st")
+    assert calls == []
+
+
+def test_own_detached_headless_child_is_not_a_peer(tmp_path):
+    repo = _git(tmp_path / "repo")
+    procs = _base(repo, None) + [(200, 1, "claude", ROOT_START + 9, str(repo), {"CLAUDE_PID": "100"})]
+    root = _proc(tmp_path, procs)
+    pr = soma_work.peers(soma_lib.proc_table(root), root, 901, str(repo))
+    assert pr == {"here": 0, "total": 1}
+    # an unreadable environ leaves the candidate a peer
+    procs2 = _base(repo, None) + [(200, 1, "claude", ROOT_START + 9, str(repo), None)]
+    (tmp_path / "b").mkdir()
+    root2 = _proc(tmp_path / "b", procs2)
+    assert soma_work.peers(soma_lib.proc_table(root2), root2, 901, str(repo))["here"] == 1
+
+
+def test_symlinked_cwd_is_resolved_before_comparing(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    os.symlink(real, link)
+    procs = _base(real, None) + [(300, 1, "claude", ROOT_START + 5, str(real), None)]
+    root = _proc(tmp_path, procs)
+    assert soma_work.peers(soma_lib.proc_table(root), root, 901, str(link))["here"] == 1
+
+
+def test_session_root_is_the_topmost_claude(tmp_path):
+    repo = _git(tmp_path / "repo")
+    procs = [(1, 0, "systemd", 0, None, None),
+             (100, 1, "claude", ROOT_START, str(repo), None),
+             (150, 100, "claude", ROOT_START + 10, str(repo), None),
+             (900, 150, "bash", 9999 * HZ, str(repo), None),
+             (901, 900, "python3", 9999 * HZ, str(repo), None),
+             (300, 1, "claude", ROOT_START + 5, str(tmp_path), None)]
+    root = _proc(tmp_path, procs)
+    # 150 is under 100, so it is neither the root nor a peer; 300 is the one other session
+    assert soma_work.peers(soma_lib.proc_table(root), root, 901, str(repo)) == {"here": 0, "total": 2}
+
+
+def _finishes(fn, limit=2.0):
+    box = []
+    t = threading.Thread(target=lambda: box.append(fn()), daemon=True)
+    t.start()
+    t.join(limit)
+    return not t.is_alive(), box
+
+
+def test_fifo_at_dot_git_does_not_hang(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    os.mkfifo(repo / ".git")
+    done, box = _finishes(lambda: soma_work.git_head(str(repo)))
+    assert done and box == [None]
+
+
+def test_fifo_at_head_does_not_hang(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    os.mkfifo(repo / ".git" / "HEAD")
+    done, box = _finishes(lambda: soma_work.git_head(str(repo)))
+    assert done and box == [None]
+
+
+def test_empty_head_keeps_the_record_and_a_later_move_is_said(tmp_path):
+    repo = _git(tmp_path / "repo")
+    root = _proc(tmp_path, _base(repo, None))
+    sd = tmp_path / "st"
+    _reading(root, repo, sd, now=5000.0)
+    (repo / ".git" / "HEAD").write_text("")
+    assert not any("HEAD" in s for s in _reading(root, repo, sd, now=5001.0)["segs"])
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/other\n")
+    assert any("HEAD main→other" in s for s in _reading(root, repo, sd, now=5002.0)["segs"])
+
+
+@pytest.mark.parametrize("tool,cmd,absorbed", [
+    ("Bash", "cat .gitignore", False),
+    ("Bash", "ls; git checkout x", True),
+    ("Bash", "git", True),
+    ("Bash", "(git switch y)", True),
+    ("Bash", "echo legit stuff", False),
+    ("Edit", "git checkout x", False),
+])
+def test_own_git_command_is_a_command_word_in_bash_only(tmp_path, tool, cmd, absorbed):
+    repo = _git(tmp_path / "repo")
+    root = _proc(tmp_path, _base(repo, None))
+    sd = tmp_path / "st"
+    _reading(root, repo, sd, now=5000.0, pulse=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/other\n")
+    out = _reading(root, repo, sd, now=5001.0, pulse=True, extra={"tool_name": tool, "tool_input": {"command": cmd}})
+    assert any("HEAD" in s for s in out["segs"]) is (not absorbed)
+
+
+def test_hook_and_statusline_children_are_not_leftovers_but_detached_work_is(tmp_path):
+    repo = _git(tmp_path / "repo")
+    old = 2000 * HZ
+    procs = _base(repo, None) + [
+        (400, 100, "sh", old, str(repo), {"CLAUDE_PID": "100", "CLAUDE_PROJECT_DIR": "x"}),
+        (401, 400, "sleep", old, str(repo), {"CLAUDE_PID": "100", "CLAUDE_PROJECT_DIR": "x"}),
+        (500, 1, "node", old + 1, str(repo), {"CLAUDE_PID": "100"}),
+    ]
+    root = _proc(tmp_path, procs)
+    bg = soma_work.leftovers(soma_lib.proc_table(root), root, 901, 600)
+    assert bg is not None and bg["count"] == 1 and bg["name"] == "node"

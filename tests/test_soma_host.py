@@ -242,8 +242,9 @@ def test_old_state_file_without_stale_record(tmp_path, monkeypatch):
 @pytest.mark.parametrize("procs,want", [
     ([(5, 1, "unattended-upgr")], "unattended-upgr"),
     ([(5, 1, "apt-get"), (6, 5, "dpkg")], "apt-get,dpkg"),
+    # plesk_installer is no process name: Plesk's updater runs as autoinstaller
     ([(5, 1, "apt"), (7, 1, "aptitude"), (8, 1, "plesk_installer"), (9, 1, "autoinstaller")],
-     "apt,aptitude,autoinstaller,plesk_installer"),
+     "apt,aptitude,autoinstaller"),
     ([(5, 1, "packagekitd"), (6, 5, "dpkg")], "dpkg,packagekitd"),
     ([(5, 1, "packagekitd")], None),
     ([(5, 1, "packagekitd"), (6, 5, "bash")], None),
@@ -329,3 +330,72 @@ print(soma_lib.line_for_mode("always", proc_root={proc!r}, mounts=[], services=[
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == with_mod
     assert "STALE" not in with_mod and "apt busy" not in with_mod
+
+
+# --- 0.12.0 pre-release fixes: statvfs, one probe per source, interval, stamp first ------------
+
+def test_probe_is_statvfs():
+    import os
+    assert soma_host.DEFAULT_PROBE is os.statvfs  # the autouse fixture swaps PROBE itself
+
+
+def test_mount_table_carries_the_source(tmp_path):
+    proc = _proc(tmp_path, mounts="//nas/public /mnt/nas cifs ro 0 0\n//nas/public /mnt/nas-rw cifs rw 0 0\n"
+                                  "/dev/md2 / ext4 rw 0 0\n")
+    assert soma_host.net_mount_table(proc) == [("//nas/public", "/mnt/nas"), ("//nas/public", "/mnt/nas-rw")]
+
+
+def test_one_probe_per_source_applied_to_every_mount_point():
+    calls = []
+
+    def hang(p):
+        calls.append(p)
+        threading.Event().wait()
+    entries = [("//nas/public", "/mnt/nas"), ("//nas/public", "/mnt/nas-rw"), ("srv:/x", "/mnt/x")]
+    stale, rec = soma_host.stale_mounts(entries, {}, 1000.0, probe=lambda p: calls.append(p) if p == "/mnt/x" else hang(p),
+                                        timeout_s=0.1)
+    assert sorted(calls) == ["/mnt/nas", "/mnt/x"]
+    assert stale == ["/mnt/nas", "/mnt/nas-rw"] and rec == {"//nas/public": 1000.0}
+
+
+def test_no_probe_inside_the_interval_and_stamp_before_the_call():
+    order, stamps = [], {}
+
+    def probe(p):
+        order.append(("probe", dict(stamps)))
+        raise OSError("answer")
+
+    def stamp(s):
+        order.append(("stamp", dict(s)))
+    e = [("//nas/public", "/mnt/nas")]
+    soma_host.stale_mounts(e, {}, 1000.0, probe=probe, timeout_s=0.1, stamps=stamps, interval_s=30, stamp=stamp)
+    assert order == [("stamp", {"//nas/public": 1000.0}), ("probe", {"//nas/public": 1000.0})]
+    for t in (1001.0, 1010.0, 1029.9):
+        soma_host.stale_mounts(e, {}, t, probe=probe, timeout_s=0.1, stamps=stamps, interval_s=30, stamp=stamp)
+    assert len(order) == 2
+    soma_host.stale_mounts(e, {}, 1030.0, probe=probe, timeout_s=0.1, stamps=stamps, interval_s=30, stamp=stamp)
+    assert len(order) == 4 and stamps == {"//nas/public": 1030.0}
+
+
+def test_between_probes_the_last_result_stands():
+    e = [("//nas/public", "/mnt/nas")]
+    stamps = {}
+    stale, rec = soma_host.stale_mounts(e, {}, 1000.0, probe=_never, timeout_s=0.05, stamps=stamps, interval_s=30)
+    assert stale == ["/mnt/nas"]
+    # past the 60 s back-off but another session stamped a probe 5 s ago: still stale, no probe
+    stamps["//nas/public"] = 1065.0
+    stale, rec = soma_host.stale_mounts(e, rec, 1070.0, probe=lambda p: 1 / 0, timeout_s=0.05, stamps=stamps,
+                                        interval_s=30)
+    assert stale == ["/mnt/nas"]
+
+
+def test_probe_interval_through_the_hook_state(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(soma_host, "PROBE", lambda p: calls.append(p))
+    proc = _proc(tmp_path, mounts="//nas/public /mnt/nas cifs ro 0 0\n//nas/public /mnt/nas-rw cifs rw 0 0\n")
+    for t in (1000.0, 1005.0, 1020.0):
+        _line(tmp_path, proc, now=t)
+    assert calls == ["/mnt/nas"]
+    assert _state(tmp_path)["net_probe"] == {"//nas/public": 1000.0}
+    _line(tmp_path, proc, now=1031.0)
+    assert len(calls) == 2
