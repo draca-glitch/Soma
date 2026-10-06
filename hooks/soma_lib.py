@@ -54,6 +54,14 @@ except Exception:
     def _write_session(subdir, sid, doc, sdir=None, now=None):
         return False
 
+# Compaction awareness (0.11.0), same guard: without soma_compact.py (or with a broken
+# one) the line is the plain one and no notice is ever announced.
+try:
+    from soma_compact import take_notice as _take_compact_notice
+except Exception:
+    def _take_compact_notice(sid, sdir=None, now=None):
+        return None
+
 
 PULSE_SUBDIR = "soma-pulse"
 
@@ -802,16 +810,23 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     a = assess(state, events=events, trends=trends)
     doc["last_flags"] = sorted(a["flags"])
     ctx_seg, ctx_high = context_segment(hook_input, state_dir, now) if hook_input else (None, False)
+    subagent = isinstance(hook_input, dict) and bool(hook_input.get("agent_id"))
+    # a pending compaction notice forces the line like a full context does; it is marked
+    # announced before it is printed, so it is said once and only if that was recorded
+    compact_seg = _take_compact_notice(sid, state_dir, now) if sid and not subagent else None
     line = None
-    if mode == "always" or a["flags"] or ctx_high:
+    if mode == "always" or a["flags"] or ctx_high or compact_seg:
         line = render(state, a)
         if ctx_seg:
             line += " · " + ctx_seg
+        if compact_seg:
+            line += " · " + compact_seg
     # what this session has now been told, so the pulse neither repeats nor misses it
     _record_prompt_told(doc, sid, sdoc, a, line is not None, counters, state_dir, now)
     save_state(doc, state_dir)
     if line:
-        log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set()), state_dir)
+        log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set())
+                     | ({"COMPACT"} if compact_seg else set()), state_dir)
     return line
 
 
@@ -998,13 +1013,20 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
         told = _write_session(PULSE_SUBDIR, sid, {"ts": int(now), "held": new_held,
                                                   "counters": _acute_baseline(counters)}, state_dir, now)
         save_state(doc, state_dir)
+        # a pending compaction notice is a reason to emit on its own (an automatic
+        # compaction happens mid-turn, with no prompt after it); taken only when the
+        # told-state was written, so a line that will not print never consumes it
+        compact_seg = _take_compact_notice(sid, state_dir, now) if told else None
     else:
         appeared, recovered, new_held = pulse_transition(_seed_held(prev), a["flags"], now, hold_s)
         doc["pulse_held"] = new_held
         told = save_state(doc, state_dir)
-    if (appeared or recovered) and told:
+        compact_seg = None
+    if (appeared or recovered or compact_seg) and told:
         line = render(state, a)
-        log_emission(line, a["flags"], state_dir, src="pulse")
+        if compact_seg:
+            line += " · " + compact_seg
+        log_emission(line, a["flags"] | ({"COMPACT"} if compact_seg else set()), state_dir, src="pulse")
         return line
     return None
 

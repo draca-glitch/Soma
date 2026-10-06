@@ -88,12 +88,18 @@ Drop the hooks somewhere Claude Code can run them (e.g. `~/.claude/hooks/`) and 
     ],
     "PostToolUse": [
       { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-pulse.py", "timeout": 2 }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-compact.py", "timeout": 10 }] }
+    ],
+    "PostCompact": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-compact.py", "timeout": 10 }] }
     ]
   }
 }
 ```
 
-The hook `timeout` is in seconds, not milliseconds. `soma_lib.py` and `soma_ctx.py` must sit beside `soma-state.py`. Python 3.10+, no dependencies.
+The hook `timeout` is in seconds, not milliseconds. `soma_lib.py`, `soma_ctx.py` and `soma_compact.py` must sit beside `soma-state.py` (without `soma_compact.py` the hooks run as before, with no compaction notice). Python 3.10+, no dependencies.
 
 ## Context window
 
@@ -116,6 +122,24 @@ The bridge prints nothing and always exits 0, whatever it is fed, so it cannot a
 The hook trusts a state file for up to `SOMA_CTX_MAX_AGE_S` (default one day). Context only changes on a model call and every model call refreshes the statusline, so an idle session's numbers stay true overnight; the limit only retires a file after the integration was removed or a session is resumed much later.
 
 **Fallback.** Without a usable state file (no statusline bridge, a stale file, another harness), the hook reads the last assistant `usage` entry of the session transcript, scanning backwards from the end and never more than 4 MiB, and renders `ctx 866k`: tokens only, no percentage and no `(HIGH)`, because the transcript does not carry the window size. With neither source the segment is absent and the line is exactly what it was before. `SOMA_CTX=0` turns the segment off.
+
+## Compaction
+
+When Claude Code compacts a session, the agent keeps a prose summary and loses the concrete things it was holding: file paths, commit hashes, ids, URLs, the user's exact words. It cannot tell what went missing. `soma-compact.py` (one command for both `PreCompact` and `PostCompact`, entries above) tells it, once, in one line, and leaves an index file to get the identifiers back. Zero LLM, no network.
+
+- **PreCompact** indexes the span about to be compacted: main-chain entries after the previous compaction boundary (or from the start) up to the end, read backwards and never more than 64 MiB. Indexed are the user's text, the assistant's text and every string in a tool call's input; tool results are not (an `ls` of a thousand files is not something the agent was holding), except agent ids written as `agentId: <id>`. Sidechain (subagent) entries, meta entries and system reminders (the harness re-injects those) are skipped.
+- **PostCompact** diffs that index against `compact_summary` and the messages the harness kept verbatim (`compactMetadata.preservedMessages` of the boundary entry, when it is already in the transcript). Without a fresh PreCompact index it builds one from the transcript itself, so either order of the harness's writes works.
+- The next hook to run for that session, the prompt hook or the pulse (a mid-turn automatic compaction has no prompt after it), appends the notice as the line's last segment, emitting even on a healthy box, and marks it said. A subagent's tool call never consumes it; a notice nobody announced within 24 hours is dropped.
+
+```
+[system-state] mem 35.2G/61G avail 57% · swap 0 · / 41% · load 2/16 · ctx 4% (38k/1000k) · compacted 20:41 (866k→38k) · dropped: 37 paths, 12 hashes, 9 ids → /root/.claude/state/soma-compact/<sid>-<epoch>.md
+```
+
+Classes with nothing dropped are left out; with nothing dropped at all it reads `compacted 20:41 (866k→38k) · nothing dropped`. The token figures come from the boundary's `compactMetadata` and are left out when unknown. From a session's second compaction on it reads `compacted ×2 20:41 ...`: a summary of a summary deserves less trust. The emission is logged with the flag `COMPACT`.
+
+The **index file** (Markdown, mode 0600 because it holds the user's words) lists the dropped identifiers per class (paths, hashes, ids, urls, agents), most-mentioned first, at most 500 per class with the true count stated, then "User messages, verbatim": every human-typed message of the compacted span in order (each capped at 2000 characters, the newest 200 kept; tool results, hook output, system reminders and meta entries excluded). The classes: absolute paths with at least two segments (not a URL's path), hex hashes of 7 to 40 characters with at least one digit and one letter, `#123` style ids of 3 to 7 digits, `http(s)` URLs, agent ids.
+
+**Limits, plainly.** It recovers identifiers, not reasoning: why a path mattered is gone with the summary. "Kept" means a literal occurrence in the summary or in a preserved message (a path also counts as kept when its basename occurs as a whole token), so an identifier the summary paraphrases counts as dropped, and one it mentions in passing counts as kept. State lives in `soma-compact/` under the state directory (`<sid>.pre.json`, `<sid>.json`, `<sid>-<epoch>.md`), pruned after three days. `SOMA_COMPACT=0` turns all of it off.
 
 ## Configuration
 
@@ -154,7 +178,8 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_CTX_PCT` | `85` | mark `ctx` `(HIGH)` and emit in pressure mode when the context window is at least this percent full; `0` disables the mark |
 | `SOMA_CTX_MAX_AGE_S` | `86400` | oldest statusline state file the hook still trusts; older falls back to the transcript |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |
-| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json`, `soma-ctx/` and `soma-pulse/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
+| `SOMA_COMPACT` | `1` | compaction awareness (the `soma-compact.py` hook and the notice); `0`, `off`, `false`, `no` disable |
+| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json`, `soma-ctx/`, `soma-pulse/` and `soma-compact/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
 
 ## Relationship to the research
 
