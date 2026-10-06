@@ -176,7 +176,16 @@ def test_save_state_uses_pid_unique_temp_and_cleans_up(tmp_path, monkeypatch):
     sd = tmp_path / "s"
     sd.mkdir()
     (sd / "soma-state.json.tmp").write_text("{torn")        # the old shared name is never read
+    used = []
+    real_replace = soma_lib.os.replace
+
+    def spy(src, dst):
+        used.append(Path(src).name)
+        return real_replace(src, dst)
+    monkeypatch.setattr(soma_lib.os, "replace", spy)
     assert soma_lib.save_state({"a": 1}, str(sd)) is True
+    assert len(used) == 1 and f".{os.getpid()}." in used[0]  # a shared temp name fails here
+    monkeypatch.setattr(soma_lib.os, "replace", real_replace)
     assert soma_lib.load_state(str(sd)) == {"a": 1}
     assert not list(sd.glob(f".soma-state.json.{os.getpid()}.tmp"))
 
@@ -263,3 +272,116 @@ def test_session_write_leaves_host_pulse_held(tmp_path):
     st = json.loads((tmp_path / "state" / "soma-state.json").read_text())
     assert st["pulse_held"] == {"SWAP": None}
     assert _pulse(tmp_path, sick, 3) is None                # host-wide adapter not re-told
+
+
+# --- 0.10.1 fix round 2, R1: a session's first contact hears what the host saw -------
+
+def _host_counters(tmp_path):
+    return json.loads((tmp_path / "state" / "soma-state.json").read_text()).get("counters")
+
+
+def test_first_prompt_of_new_session_reports_kill_since_host_sample(tmp_path):
+    assert _prompt(tmp_path, _proc(tmp_path, 0), 0, "X") is None
+    p = _proc(tmp_path, 1)
+    assert _oom(_prompt(tmp_path, p, 10, "Y"), 1)            # the kill that took X down
+    assert json.loads(_sfile(tmp_path, "Y").read_text())["counters"] == {"oom_kill": 1}
+    assert _prompt(tmp_path, p, 11, "Y") is None             # from the second contact: per session
+    assert _pulse(tmp_path, p, 12, "Y") is None
+
+
+def test_first_pulse_of_new_session_reports_kill_since_host_sample(tmp_path):
+    assert _prompt(tmp_path, _proc(tmp_path, 0), 0, "X") is None
+    p = _proc(tmp_path, 1)
+    assert _oom(_pulse(tmp_path, p, 10, "Y"), 1)
+    assert _pulse(tmp_path, p, 11, "Y") is None
+    assert _prompt(tmp_path, p, 12, "Y") is None
+
+
+@pytest.mark.parametrize("via", ["prompt", "pulse"])
+def test_first_contact_without_host_counters_is_silent(tmp_path, via):
+    p = _proc(tmp_path, 3)
+    first = _prompt(tmp_path, p, 0, "Y") if via == "prompt" else _pulse(tmp_path, p, 0, "Y")
+    assert first is None
+    assert _prompt(tmp_path, p, 1, "Y") is None
+
+
+def test_subagent_first_contact_leaves_the_kill_for_the_main_agent(tmp_path):
+    assert _prompt(tmp_path, _proc(tmp_path, 0), 0, "X") is None
+    p = _proc(tmp_path, 1)
+    assert _pulse(tmp_path, p, 10, "Y", sub=True) is None
+    assert not _sfile(tmp_path, "Y").exists()
+    assert _host_counters(tmp_path) == {"oom_kill": 0}       # the subagent consumed nothing
+    assert _oom(_pulse(tmp_path, p, 11, "Y"), 1)
+    assert _pulse(tmp_path, p, 12, "Y") is None
+
+
+def test_session_file_without_counters_key_is_a_first_contact(tmp_path):
+    assert _prompt(tmp_path, _proc(tmp_path, 0), 0, "X") is None
+    d = tmp_path / "state" / "soma-pulse"
+    (d / "Y.json").write_text(json.dumps({"ts": 0, "held": {}}))   # a b5f5e85 session file
+    p = _proc(tmp_path, 1)
+    assert _oom(_prompt(tmp_path, p, 10, "Y"), 1)
+    assert _prompt(tmp_path, p, 11, "Y") is None
+
+
+# --- 0.10.1 fix round 2, R2: the hold survives a silent prompt -----------------------
+
+LOW = dict(avail=1000000)
+
+
+def test_reappearance_inside_hold_stays_silent_across_silent_prompts(tmp_path):
+    ok, low = _proc(tmp_path, 0), _proc(tmp_path, 0, "low", **LOW)
+    assert _prompt(tmp_path, low, 0, "A")                    # told LOW_MEM
+    assert _pulse(tmp_path, ok, 10, "A") is None             # absent, inside the hold
+    assert _prompt(tmp_path, ok, 20, "A") is None            # silent prompt
+    assert _pulse(tmp_path, low, 25, "A") is None            # back inside the hold: no news
+    assert _pulse(tmp_path, ok, 30, "A") is None
+    assert _prompt(tmp_path, ok, 40, "A") is None
+    assert _pulse(tmp_path, low, 45, "A") is None
+
+
+def test_silent_prompt_starts_the_absence_clock_and_pulse_announces_recovery(tmp_path):
+    ok, low = _proc(tmp_path, 0), _proc(tmp_path, 0, "low", **LOW)
+    assert _prompt(tmp_path, low, 0, "A")                    # told LOW_MEM
+    assert _prompt(tmp_path, ok, 20, "A") is None            # cleared just before a silent prompt
+    held = json.loads(_sfile(tmp_path, "A").read_text())["held"]
+    assert held == {"LOW_MEM": 20}                           # kept, absent since this prompt
+    assert _pulse(tmp_path, ok, 100, "A") is None            # inside the hold
+    assert _pulse(tmp_path, ok, 319, "A") is None
+    assert _pulse(tmp_path, ok, 320, "A")                    # the recovery, once
+    assert _pulse(tmp_path, ok, 330, "A") is None
+    assert json.loads(_sfile(tmp_path, "A").read_text())["held"] == {}
+
+
+def test_silent_prompt_keeps_an_existing_absence_timestamp(tmp_path):
+    ok, low = _proc(tmp_path, 0), _proc(tmp_path, 0, "low", **LOW)
+    assert _prompt(tmp_path, low, 0, "A")
+    assert _pulse(tmp_path, ok, 10, "A") is None             # absent since 10
+    assert _prompt(tmp_path, ok, 20, "A") is None
+    assert json.loads(_sfile(tmp_path, "A").read_text())["held"] == {"LOW_MEM": 10}
+    assert _pulse(tmp_path, ok, 309, "A") is None
+    assert _pulse(tmp_path, ok, 310, "A")
+
+
+def test_emitting_prompt_still_replaces_told_state(tmp_path):
+    ok, low = _proc(tmp_path, 0), _proc(tmp_path, 0, "low", **LOW)
+    sick = _proc(tmp_path, 0, "sick", **SICK)
+    assert _prompt(tmp_path, low, 0, "A")
+    assert _prompt(tmp_path, ok, 10, "A") is None            # LOW_MEM held, absent since 10
+    assert _prompt(tmp_path, sick, 20, "A")                  # emits SWAP only
+    assert json.loads(_sfile(tmp_path, "A").read_text())["held"] == {"SWAP": None}
+    assert _pulse(tmp_path, sick, 400, "A") is None          # LOW_MEM was told cleared on the line
+
+
+def test_silent_prompt_without_session_id_starts_host_absence_clock(tmp_path):
+    ok, low = _proc(tmp_path, 0), _proc(tmp_path, 0, "low", **LOW)
+    assert _prompt(tmp_path, low, 0)                         # host-wide record: LOW_MEM told
+    assert _prompt(tmp_path, ok, 20) is None
+    st = json.loads((tmp_path / "state" / "soma-state.json").read_text())
+    assert st["pulse_held"] == {"LOW_MEM": 20}
+    assert _pulse(tmp_path, low, 25) is None                 # reappearance inside the hold
+    assert _pulse(tmp_path, ok, 30) is None
+    assert _prompt(tmp_path, ok, 40) is None
+    assert _pulse(tmp_path, ok, 329) is None
+    assert _pulse(tmp_path, ok, 330)                         # recovery once, after the hold
+    assert _pulse(tmp_path, ok, 331) is None

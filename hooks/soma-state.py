@@ -16,8 +16,11 @@ the agent's own context fill and plan rate limits for this session:
 Without it, the context tokens come from the transcript: ... · ctx 866k
 SOMA_CTX=0 turns the segment off.
 
-When it emits, it also records what this session was told (<state_dir>/soma-pulse/
-<session_id>.json), so the mid-turn pulse hook does not repeat it.
+On every prompt it also records what this session has been told (<state_dir>/soma-pulse/
+<session_id>.json): the flags on its line when it emits, else the flags told before with
+their absence clocks started, so the mid-turn pulse hook neither repeats a condition nor
+re-announces one that flickers inside the hold. A session's first contact reports the
+OOM/ECC events the host has seen since its last sample, then takes its own baseline.
 
 A healthy box stays silent. Logic lives in soma_lib.py; this hook is just
 the renderer plus the emission log. It never raises into the prompt path.

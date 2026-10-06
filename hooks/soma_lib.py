@@ -792,7 +792,8 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
                                                     state_dir, now)
     counters = state.get("counters", {})
     sid = _hook_sid(hook_input)
-    events = _session_events(counters, _read_session(PULSE_SUBDIR, sid, state_dir)) if sid else host_events
+    sdoc = _read_session(PULSE_SUBDIR, sid, state_dir) if sid else None
+    events = _session_events(counters, sdoc, host_events) if sid else host_events
     a = assess(state, events=events, trends=trends)
     doc["last_flags"] = sorted(a["flags"])
     ctx_seg, ctx_high = context_segment(hook_input, state_dir, now) if hook_input else (None, False)
@@ -802,7 +803,7 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
         if ctx_seg:
             line += " · " + ctx_seg
     # what this session has now been told, so the pulse neither repeats nor misses it
-    _record_prompt_told(doc, sid, a, line is not None, counters, state_dir, now)
+    _record_prompt_told(doc, sid, sdoc, a, line is not None, counters, state_dir, now)
     save_state(doc, state_dir)
     if line:
         log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set()), state_dir)
@@ -900,12 +901,20 @@ def _acute_baseline(counters: dict) -> dict:
     return {k: counters[k] for k in ACUTE_COUNTERS if isinstance(counters.get(k), int)}
 
 
-def _session_events(counters: dict, sdoc: dict | None) -> dict:
-    """Events as this session sees them: the acute counters diffed against the session's own
-    baseline (a session with no baseline yet hears no past events; a counter that went
-    backwards yields nothing), plus the live degraded levels."""
-    base = _clean_counters(sdoc.get("counters")) if isinstance(sdoc, dict) else {}
-    return diff_events(counters, base)
+def _has_counter_baseline(sdoc) -> bool:
+    return isinstance(sdoc, dict) and isinstance(sdoc.get("counters"), dict)
+
+
+def _session_events(counters: dict, sdoc: dict | None, host_events: dict | None = None) -> dict:
+    """Events as this session sees them. From its second contact on: the acute counters diffed
+    against the session's own baseline (a counter that went backwards, or a junk baseline, yields
+    nothing), plus the live degraded levels. At its first contact (no session file, or one
+    without a counter baseline): host_events, the host-wide delta since the host's last sample,
+    as v0.10.0 reported it (empty when the host has no counters yet); the caller then stores
+    the session's own baseline."""
+    if not _has_counter_baseline(sdoc):
+        return dict(host_events) if isinstance(host_events, dict) else {}
+    return diff_events(counters, _clean_counters(sdoc.get("counters")))
 
 
 def _seed_held(prev: dict) -> dict:
@@ -951,9 +960,10 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
     heard by every session independently. Only the session's own main-agent
     samples (this and the prompt hook) touch that file: a tool call inside a
     subagent (hook_input carries agent_id) announces nothing and leaves it
-    alone, so the main agent hears the event on its next call. A first contact
-    with no session file is told the standing flags once and baselines the
-    counters without announcing past events. Without a session id (or with an
+    alone (nor advances the host counters), so the main agent hears the event on
+    its next call. A first contact (no session file, or one without a counter
+    baseline) is told the standing flags once and the acute events the host has
+    seen since its last sample, then takes its own counter baseline. Without a session id (or with an
     older soma_ctx.py) the told-state and counters are host-wide. Nothing is
     announced unless the told-state it implies was written.
     """
@@ -967,10 +977,14 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
     sid = _hook_sid(hook_input)
     subagent = isinstance(hook_input, dict) and bool(hook_input.get("agent_id"))
     sdoc = _read_session(PULSE_SUBDIR, sid, state_dir) if sid and not subagent else None
-    events = _session_events(counters, sdoc) if sid and not subagent else host_events
+    events = _session_events(counters, sdoc, host_events) if sid and not subagent else host_events
     a = assess(state, events=events, trends=trends)
     doc["last_flags"] = sorted(a["flags"])
     if subagent:
+        # the host counters stay where they were: a main agent's first contact (or a caller
+        # without a session id) still hears what this call saw and could not announce
+        if isinstance(prev.get("counters"), dict):
+            doc["counters"] = prev["counters"]
         save_state(doc, state_dir)
         return None
     if sid:
@@ -990,17 +1004,37 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
     return None
 
 
-def _record_prompt_told(doc: dict, sid: str | None, a: dict, emitted: bool,
+def _age_held(held: dict | None, flags: set, now: float) -> dict:
+    """A silent prompt's told-state: every held flag kept; one absent now gets its absence clock
+    started at now unless it already has one, one present is reset to None. The pulse then
+    announces a recovery only after the hold, and a reappearance inside it stays silent."""
+    out = {}
+    for f, since in (held or {}).items():
+        out[f] = None if f in flags else (since if since is not None else now)
+    return out
+
+
+def _record_prompt_told(doc: dict, sid: str | None, sdoc, a: dict, emitted: bool,
                         counters: dict, state_dir: str | None, now: float) -> None:
-    """The prompt hook's told-state: exactly the chronic flags on the line it printed (none when
-    it stayed silent; a flag that cleared is thereby told-cleared), plus the session's acute
-    baseline. With a session id it goes to the session file, written on every prompt; without
-    one, the host-wide record is updated only when a line was printed (the pre-0.10.1 rule)."""
-    told = {f: None for f in a["flags"] if f not in ACUTE_FLAGS} if emitted else {}
+    """The prompt hook's told-state. A printed line defines it: exactly the chronic flags on the
+    line (a flag that cleared is thereby told-cleared). A silent prompt keeps what was told and
+    starts the absence clock of each held flag that is gone (_age_held). With a session id it
+    goes to the session file, with the session's acute baseline, on every prompt; without one,
+    to the host-wide record (left alone by a silent prompt when there is none yet)."""
+    if emitted:
+        told = {f: None for f in a["flags"] if f not in ACUTE_FLAGS}
+    elif sid:
+        told = _age_held(_clean_held(sdoc.get("held"), now) if isinstance(sdoc, dict) else None,
+                         a["flags"], now)
+    else:
+        held = _clean_held(doc.get("pulse_held"), now)
+        if held is None:
+            return
+        told = _age_held(held, a["flags"], now)
     if sid:
         _write_session(PULSE_SUBDIR, sid, {"ts": int(now), "held": told,
                                            "counters": _acute_baseline(counters)}, state_dir, now)
-    elif emitted:
+    else:
         doc["pulse_held"] = told
 
 
