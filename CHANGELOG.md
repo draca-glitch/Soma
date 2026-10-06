@@ -8,6 +8,19 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+## [0.10.0] - 2026-10-06
+
+The agent feels its own context window and its plan's quota.
+
+### Added
+- **Context-window and rate-limit segment**: `ctx 87% (866k/1000k) · 5h 7% · 7d 19%` at the end of the `[system-state]` line. Claude Code hands these numbers only to the statusline command, so the new `hooks/soma-context.py` is a bridge a statusline script pipes its stdin JSON to (`printf '%s' "$input" | ~/.claude/hooks/soma-context.py`). It writes `<state_dir>/soma-ctx/<session_id>.json` (session id reduced to `[A-Za-z0-9_-]`, temp file plus rename), prints nothing and exits 0 on any input, and prunes files of sessions silent for three days at most once an hour. Motivation: an agent at 87% can save state before compaction, and one that sees the quota can hold back on subagents.
+- **`(HIGH)` at `SOMA_CTX_PCT`** (default 85, `0` disables the mark), the same marker disk and load use. A high fill makes the line emit in pressure mode; it is logged as flag `CTX` in `soma-log.jsonl` but kept out of `last_flags`, so the pulse hook does not read it as a transition.
+- **Freshness**: the hook trusts a state file for `SOMA_CTX_MAX_AGE_S` (default 86400). Context changes only on a model call, which also refreshes the statusline, so an idle session's numbers stay true overnight. A rate-limit window whose `resets_at` has passed is dropped.
+- **Transcript fallback**: without a usable state file the hook reads the last assistant `usage` from the session transcript (backwards from the end, bounded to 4 MiB, sidechain and zero-usage entries skipped) and renders `ctx 866k`, no percentage, since the transcript does not carry the window size. Measured 0.05 ms on a 62 MB live transcript, under 5 ms in the worst bounded case.
+- **`SOMA_CTX=0`** turns the segment off. With no context data the line is byte-identical to 0.9.2.
+- `hooks/soma_ctx.py` holds both halves (json/os/time only, so the statusline bridge starts fast); `soma_lib._state_dir()` now delegates to it. `soma-state.py` passes its stdin JSON (`session_id`, `transcript_path`) to `line_for_mode(hook_input=...)`. Adapters that run `soma-state.py` with the hook payload inherit the segment.
+- 29 new tests (101 total).
+
 ### Changed
 - Public author identity is Mikael Wedlund (`CITATION.cff`, LICENSE, README). The GitHub account remains `draca-glitch`.
 

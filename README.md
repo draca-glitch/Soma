@@ -38,6 +38,7 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Movement**: rates of change against a rolling anchor (default 10 min window): RAM draining toward empty, a mount filling toward full, the top process growing (private memory, so a seeder paging files in does not read as growth). A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
 - **Steal** (virtualized hosts): hypervisor steal share over the trend window; see the VPS section below.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
+- **Context window and quota** (Claude Code, needs the statusline bridge for the full form): how full the agent's own context window is and how much of the plan's rate limit is used, `ctx 87% (866k/1000k)(HIGH) · 5h 7% · 7d 19%`. The window is part of the body too: an agent that knows it is at 87% can save its state before the harness compacts it, and one that knows the five-hour quota is nearly spent can hold back on spawning subagents. `(HIGH)` marks a fill at or past `SOMA_CTX_PCT` (default 85), and that crossing alone makes the line emit in pressure mode. The `5h` and `7d` parts appear only on subscription plans, and a window whose `resets_at` has passed is dropped rather than shown with its old figure. See [Context window](#context-window) for the one-line setup and the fallback.
 
 ## Two hooks, two cadences
 
@@ -88,7 +89,29 @@ Drop the hooks somewhere Claude Code can run them (e.g. `~/.claude/hooks/`) and 
 }
 ```
 
-`soma_lib.py` must sit beside `soma-state.py`. Python 3.10+, no dependencies.
+`soma_lib.py` and `soma_ctx.py` must sit beside `soma-state.py`. Python 3.10+, no dependencies.
+
+## Context window
+
+Claude Code gives the context-window and rate-limit numbers only to the **statusline** command, as JSON on stdin; hooks never receive them. `soma-context.py` is the bridge: the statusline script pipes the same JSON to it, it stores the numbers for that session, and `soma-state.py` reads them at the next prompt. Add one line to your statusline script, after it has read its stdin into `$input`:
+
+```bash
+printf '%s' "$input" | ~/.claude/hooks/soma-context.py
+```
+
+The bridge prints nothing and always exits 0, whatever it is fed, so it cannot add output or an error to the statusline. It writes `soma-ctx/<session_id>.json` under the state directory (the session id is reduced to `[A-Za-z0-9_-]` first), atomically via a temp file and rename, so a hook reading at the same moment never sees a partial file:
+
+```json
+{"ts": 1791320000, "used_pct": 87, "used_tokens": 865627, "window": 1000000,
+ "five_hour": {"used_pct": 7, "resets_at": 1791327000},
+ "seven_day": {"used_pct": 19, "resets_at": 1791723600}}
+```
+
+`used_tokens` is input + cache creation + cache read of `current_usage` (null early in a session); `five_hour` and `seven_day` are null on plans without rate limits. Files of sessions that have been silent for three days are pruned during a write, at most once an hour.
+
+The hook trusts a state file for up to `SOMA_CTX_MAX_AGE_S` (default one day). Context only changes on a model call and every model call refreshes the statusline, so an idle session's numbers stay true overnight; the limit only retires a file after the integration was removed or a session is resumed much later.
+
+**Fallback.** Without a usable state file (no statusline bridge, a stale file, another harness), the hook reads the last assistant `usage` entry of the session transcript, scanning backwards from the end and never more than 4 MiB, and renders `ctx 866k`: tokens only, no percentage and no `(HIGH)`, because the transcript does not carry the window size. With neither source the segment is absent and the line is exactly what it was before. `SOMA_CTX=0` turns the segment off.
 
 ## Configuration
 
@@ -121,8 +144,11 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_STEAL_PCT` | `10` | flag `STEAL` when hypervisor steal share over the trend window crosses this percent; `0` disables |
 | `SOMA_MOUNTS` | `/,/root/work` | comma-separated mounts to check (duplicate filesystems are deduped) |
 | `SOMA_SERVICES` | *(empty)* | comma-separated services to probe; empty means no `systemctl` call |
+| `SOMA_CTX` | `1` | context-window and rate-limit segment; `0` disables |
+| `SOMA_CTX_PCT` | `85` | mark `ctx` `(HIGH)` and emit in pressure mode when the context window is at least this percent full; `0` disables the mark |
+| `SOMA_CTX_MAX_AGE_S` | `86400` | oldest statusline state file the hook still trusts; older falls back to the transcript |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |
-| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl` is written |
+| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json` and `soma-ctx/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
 
 ## Relationship to the research
 

@@ -11,6 +11,7 @@ service probing, threshold gating, one-line rendering. Pure stdlib.
 
 Used by:
   - soma-state.py (emits [system-state] summary line on UserPromptSubmit)
+  - soma-pulse.py (emits on flag transitions on PostToolUse)
   - future evaluators that replay the emission log
 
 Design rules (mirrors the sibling Kairos):
@@ -28,6 +29,8 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+
+from soma_ctx import context_segment, state_dir as _ctx_state_dir
 
 PAGE_KB = (os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096) / 1024
 
@@ -426,8 +429,7 @@ def compute_trends(state: dict, anchor: dict | None, now: float) -> dict:
 
 
 def _state_dir(state_dir: str | None = None) -> Path:
-    return Path(state_dir or os.environ.get("SOMA_STATE_DIR")
-                or os.environ.get("CLAUDE_KIT_STATE_DIR", str(Path.home() / ".claude" / "state")))
+    return Path(_ctx_state_dir(state_dir))
 
 
 def load_state(state_dir: str | None = None) -> dict:
@@ -739,9 +741,15 @@ def render(state: dict, a: dict) -> str:
 
 def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=None,
                   hwmon_root: str = "/sys/class/hwmon", sys_root: str = "/sys",
-                  state_dir: str | None = None, now: float | None = None) -> str | None:
+                  state_dir: str | None = None, now: float | None = None,
+                  hook_input: dict | None = None) -> str | None:
     """Top-level: gather, diff against the persisted baseline, assess, persist,
-    return the line to print or None to stay silent."""
+    return the line to print or None to stay silent.
+
+    hook_input is the hook's stdin JSON; its session_id and transcript_path
+    feed the context-window segment (soma_ctx). A full context (CTX) makes the
+    line emit in pressure mode, but CTX stays out of last_flags: it is not a
+    body condition and must not register as a transition in the pulse hook."""
     if mode == "off":
         return None
     now = now if now is not None else time.time()
@@ -753,9 +761,12 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     doc = roll_state(prev, state, now)
     doc["last_flags"] = sorted(a["flags"])
     save_state(doc, state_dir)
-    if mode == "always" or a["flags"]:
+    ctx_seg, ctx_high = context_segment(hook_input, state_dir, now) if hook_input else (None, False)
+    if mode == "always" or a["flags"] or ctx_high:
         line = render(state, a)
-        log_emission(line, a["flags"], state_dir)
+        if ctx_seg:
+            line += " · " + ctx_seg
+        log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set()), state_dir)
         return line
     return None
 
