@@ -708,10 +708,15 @@ def render(state: dict, a: dict) -> str:
     parts = []
     trends = a.get("trends", {})
     if total:
+        # The shown share is assess()'s own figure, floored: it is never above the value
+        # the LOW_MEM comparison saw, so `15%(LOW)` cannot appear at a threshold of 15.
+        pct = a.get("mem_avail_pct")
+        if pct is None:
+            pct = avail / total * 100
         tag = "(LOW)" if "LOW_MEM" in a["flags"] else ""
         if "DRAIN" in a["flags"]:
             tag += f" ({trends['mem_gb_h']:+.1f}G/h, empty ~{trends['mem_tte_h']:.1f}h)(DRAIN)"
-        parts.append(f"mem {human_kb(avail)}/{human_kb(total)} avail{tag}")
+        parts.append(f"mem {human_kb(avail)}/{human_kb(total)} avail {int(pct)}%{tag}")
     if swap_used > 0:
         parts.append(f"swap {human_kb(swap_used)}")
     else:

@@ -8,6 +8,11 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+## [0.11.0] - 2026-10-06
+
+### Changed
+- **The memory segment shows the available share**: `mem 9.4G/61.9G avail` becomes `mem 9.4G/61.9G avail 15%`, flagged `mem 9.2G/61.9G avail 14%(LOW)`. The percentage is `assess()`'s own `mem_avail_pct`, the value `SOMA_MEM_AVAIL_PCT` is compared against, floored to a whole number, so a line never shows `15%(LOW)` at a threshold of 15 unless the comparison really flagged it. A format change of every emitted line that carries memory, hence a minor.
+
 ## [0.10.1] - 2026-10-06
 
 ### Fixed

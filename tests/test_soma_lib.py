@@ -118,6 +118,29 @@ def test_render_carries_flags():
     assert line.startswith("[system-state]")
     assert "(LOW)" in line and "(TOP)" in line and "(HIGH)" in line
     assert "mnemos-mcp" in line
+    assert "avail 4%(LOW)" in line  # 3000000/64000000 = 4.69%, floored
+
+
+def _mem_state(avail, total=64000000):
+    return {"cores": 16, "mem": {"MemTotal": total, "MemAvailable": avail, "SwapTotal": 0, "SwapFree": 0},
+            "load": (0.1, 0, 0), "top": None, "disks": [], "services": []}
+
+
+def test_render_mem_shows_available_share_on_healthy_line():
+    state = _mem_state(9856000, total=64910000)  # 15.18%
+    line = soma_lib.render(state, soma_lib.assess(state))
+    assert "mem 9.4G/61.9G avail 15% " in line + " "
+    assert "(LOW)" not in line
+
+
+def test_render_mem_percentage_and_flag_from_one_value(monkeypatch):
+    monkeypatch.setenv("SOMA_MEM_AVAIL_PCT", "15")
+    exact = _mem_state(9600000, total=64000000)  # exactly 15.0: not below 15
+    line = soma_lib.render(exact, soma_lib.assess(exact))
+    assert "avail 15%" in line and "(LOW)" not in line
+    under = _mem_state(9599000, total=64000000)  # 14.998: flagged, floored to 14
+    line = soma_lib.render(under, soma_lib.assess(under))
+    assert "avail 14%(LOW)" in line and "15%(LOW)" not in line
 
 
 def _fake_proc(tmp_path, avail=36000000, total=64000000, swap_total=0, swap_free=0, load="1.0"):
@@ -417,7 +440,7 @@ def test_render_trend_annotations():
               "disks": {"/": {"gb_h": 8.0, "ttf_h": 10.0}}, "top_gb_h": 0.7}
     a = soma_lib.assess(state, trends=trends)
     line = soma_lib.render(state, a)
-    assert "(-12.0G/h, empty ~1.5h)(DRAIN)" in line
+    assert "avail 31% (-12.0G/h, empty ~1.5h)(DRAIN)" in line
     assert "(+0.7G/h)(GROW)" in line
     assert "fill / +8.0G/h (full ~10h)(FILL)" in line
 
