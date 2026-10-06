@@ -85,6 +85,13 @@ except Exception:
         return {"segs": [], "force": False, "flags": set()}
 
 
+# Host preconditions (0.12.0 part C), same guard: without soma_host.py the line is the plain one.
+try:
+    from soma_host import host_reading
+except Exception:
+    def host_reading(proc_root, table, record, now):
+        return {"stale": [], "record": {}, "pkg": None, "reboot": False}
+
 PULSE_SUBDIR = "soma-pulse"
 
 PAGE_KB = (os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096) / 1024
@@ -678,6 +685,10 @@ def assess(state: dict, th: dict | None = None, events: dict | None = None,
         flags.add("SELF")
     if state.get("numb"):
         flags.add("NUMB")
+    if state.get("stale"):
+        flags.add("STALE")
+    if state.get("pkg"):
+        flags.add("PKG")
     if swap_mb > th["swap_mb"]:
         flags.add("SWAP")
     if load_ratio > th["load_ratio"]:
@@ -788,6 +799,8 @@ def render(state: dict, a: dict) -> str:
         parts.append(f"fill {mount} +{entry['gb_h']:.1f}G/h (full ~{entry['ttf_h']:.0f}h)(FILL)")
     if state.get("numb"):
         parts.append("numb: " + ",".join(state["numb"]))
+    for mount in state.get("stale") or []:
+        parts.append(f"{mount} STALE")
     load1 = state.get("load", (0.0,))[0]
     tag = "(HIGH)" if "LOAD" in a["flags"] else ""
     parts.append(f"load {load1:.1f}/{state.get('cores', 1)}{tag}")
@@ -822,6 +835,10 @@ def render(state: dict, a: dict) -> str:
     down = [n for n, s in state.get("services", []) if s not in ("active", "unknown")]
     if down:
         parts.append("svc-down: " + ",".join(down))
+    if state.get("pkg"):
+        parts.append(f"apt busy ({state['pkg']})")
+    if state.get("reboot"):
+        parts.append("reboot pending")
     return "[system-state] " + " · ".join(parts)
 
 
@@ -879,7 +896,7 @@ ACUTE_FLAGS = {"OOM", "ECC"}
 
 # Every flag assess() can raise; anything else in a stored told-state is junk.
 KNOWN_FLAGS = {"DISK", "DRAIN", "ECC", "FILL", "GROW", "HOT", "LOAD", "LOW_MEM", "NUMB", "OOM",
-               "RAID", "SELF", "STEAL", "STRAIN", "SVC", "SWAP", "TOP"}
+               "PKG", "RAID", "SELF", "STALE", "STEAL", "STRAIN", "SVC", "SWAP", "TOP"}
 
 # The kernel's cumulative damage counters behind the acute flags.
 ACUTE_COUNTERS = ("oom_kill", "edac_ce", "edac_ue")
@@ -1002,6 +1019,11 @@ def _sample(proc_root, mounts, services, hwmon_root, sys_root, state_dir, now):
     trends = compute_trends(state, prev.get("anchor"), now)
     doc = roll_state(prev, state, now)
     _carry_pulse_held(prev, doc)
+    # host preconditions: the stale-mount back-off lives in the host-wide state
+    host = host_reading(proc_root, state.get("_procs"), prev.get("stale"), now)
+    state["stale"], state["pkg"], state["reboot"] = host["stale"], host["pkg"], host["reboot"]
+    if host["record"]:
+        doc["stale"] = host["record"]
     return state, prev, host_events, trends, doc
 
 

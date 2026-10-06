@@ -161,6 +161,16 @@ Three senses about the place the agent works in, not the machine (0.12.0). All t
 
 State: `soma-work/<sid>.json` under the state directory (`{ts, top, head, peers}`, rewritten only when one of them changes), claims next to it, pruned after three days with the other per-session files. `SOMA_PEERS=0`, `SOMA_HEAD=0`, `SOMA_BG=0` turn each off; with no peer here, no move and no leftover the line is byte-identical to before.
 
+## Host preconditions
+
+Three things that make the agent's *next* action fail or hang, sensed before it acts (0.12.0, `hooks/soma_host.py`; without the module the line is the plain one). With nothing to say the line is byte-identical to before.
+
+- **Stale network mount**: `/mnt/nas STALE`, flag **`STALE`**. Every `cifs`, `smb3`, `nfs`, `nfs4`, `fuse.sshfs` and `9p` mount in `/proc/mounts` (`SOMA_NET_MOUNTS` to name them instead, `0` off) is stat'ed in a watchdog thread under a shared deadline (`SOMA_NET_TIMEOUT_MS`, 300); no answer means the tool call that touches it would hang. An error that returns (missing, denied) is an answer. Abandoned probe threads are daemons, so the hook still exits promptly with one stuck in the kernel. While a mount is stale it is re-probed at most every 60 s (remembered in the host-wide `soma-state.json`), so a dead mount does not add its timeout to every tool call; it clears on the first probe that answers. A healthy mount renders nothing. Limit: a stat the client answers from its cache is an answer, so a transport that died while the mount root was cached shows as stale only once the kernel goes to the wire for it (a `statvfs` probe would be exact, but costs a server round trip, about 9 ms over a VPN, on every hook run).
+- **Package manager busy**: `apt busy (unattended-upgr)`, flag **`PKG`**, when a process named `apt`, `apt-get`, `aptitude`, `dpkg`, `unattended-upgr`, `plesk_installer` or `autoinstaller` runs, or `packagekitd` while it has a `dpkg` child (all names sorted, comma-joined). Read from the hook's one `/proc` walk; no lock is ever probed, since taking the dpkg lock even for an instant can make a real apt fail. The kernel cuts both `unattended-upgrade` (the worker) and `unattended-upgrade-shutdown` (an always-running daemon that holds nothing) to `unattended-upgr`; only that name has its `cmdline` read, and the daemon is not counted. `SOMA_PKG=0` off.
+- **Reboot pending**: `reboot pending` when `/run/reboot-required` exists (Debian, Ubuntu). No flag: it can stand for weeks, so it rides only on a line that is printed anyway. `SOMA_REBOOT=0` off.
+
+`STALE` and `PKG` are ordinary body flags: the prompt hook emits on them in pressure mode, and the pulse announces each appearance and, after the hold, the recovery, once per session.
+
 ## Configuration
 
 All thresholds are `SOMA_*` environment variables. Defaults are tuned for a large-RAM workstation/server; lower them on small boxes.
@@ -206,6 +216,10 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_HEAD` | `1` | HEAD-moved notice and the `HEAD` flag; `0`, `off`, `false`, `no` disable |
 | `SOMA_BG` | `1` | own leftovers segment; `0`, `off`, `false`, `no` disable |
 | `SOMA_BG_AGE_S` | `600` | minimum age in seconds before a Bash-started process counts as left over |
+| `SOMA_NET_MOUNTS` | from `/proc/mounts` | comma-separated network mounts to probe for `STALE` instead of discovering them; `0`, `off`, `false`, `no` disable |
+| `SOMA_NET_TIMEOUT_MS` | `300` | how long a network mount probe may take before the mount counts as stale |
+| `SOMA_PKG` | `1` | package manager busy and the `PKG` flag; `0`, `off`, `false`, `no` disable |
+| `SOMA_REBOOT` | `1` | the `reboot pending` segment; `0`, `off`, `false`, `no` disable |
 | `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json`, `soma-ctx/`, `soma-pulse/`, `soma-compact/` and `soma-work/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
 
 ## Relationship to the research
