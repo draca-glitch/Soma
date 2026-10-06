@@ -16,14 +16,17 @@ the agent's own context fill and plan rate limits for this session:
 Without it, the context tokens come from the transcript: ... · ctx 866k
 SOMA_CTX=0 turns the segment off.
 
+When it emits, it also records what this session was told (<state_dir>/soma-pulse/
+<session_id>.json), so the mid-turn pulse hook does not repeat it.
+
 A healthy box stays silent. Logic lives in soma_lib.py; this hook is just
 the renderer plus the emission log. It never raises into the prompt path.
 
 Modes (SOMA_MODE): pressure (default) | always | off.
 
-Usage in settings.json:
+Usage in settings.json (the hook timeout is in SECONDS):
   "UserPromptSubmit": [{
-    "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-state.py", "timeout": 2000 }]
+    "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-state.py", "timeout": 2 }]
   }]
 """
 

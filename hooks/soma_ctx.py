@@ -116,7 +116,6 @@ def _window(w) -> dict | None:
 
 def write_from_statusline(doc, sdir: str | None = None, now: float | None = None) -> None:
     """Persist the statusline's context and rate-limit numbers for this session. Never raises."""
-    tmp = None
     try:
         if not isinstance(doc, dict):
             return
@@ -138,22 +137,54 @@ def write_from_statusline(doc, sdir: str | None = None, now: float | None = None
                "five_hour": _window(rl.get("five_hour")), "seven_day": _window(rl.get("seven_day"))}
         if all(out[k] is None for k in out if k != "ts"):
             return
-        d = os.path.join(state_dir(sdir), CTX_SUBDIR)
+        write_session_json(CTX_SUBDIR, sid, out, sdir, now)
+    except Exception:
+        return
+
+
+def write_session_json(subdir: str, sid, doc: dict, sdir: str | None = None, now: float | None = None) -> bool:
+    """Atomically write <state_dir>/<subdir>/<safe sid>.json, pruning dead sessions' files
+    on the way (3 days, at most hourly). The shared per-session store of the statusline
+    bridge and the pulse hook. True when written; never raises."""
+    tmp = None
+    try:
+        sid = safe_id(sid)
+        if not sid:
+            return False
+        now = time.time() if now is None else now
+        d = os.path.join(state_dir(sdir), subdir)
         os.makedirs(d, exist_ok=True)
         tmp = os.path.join(d, f".{sid}.{os.getpid()}.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(out))
+            f.write(json.dumps(doc))
         os.replace(tmp, os.path.join(d, sid + ".json"))
         tmp = None
         _maybe_prune(d, now)
+        return True
     except Exception:
-        return
+        return False
     finally:
         if tmp:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def read_session_json(subdir: str, sid, sdir: str | None = None) -> dict | None:
+    """The dict stored by write_session_json for this session, or None when absent, corrupt or oversized."""
+    try:
+        sid = safe_id(sid)
+        if not sid:
+            return None
+        with open(os.path.join(state_dir(sdir), subdir, sid + ".json"), "rb") as f:
+            raw = f.read(65537)
+        if len(raw) > 65536:
+            return None
+        doc = json.loads(raw)
+        return doc if isinstance(doc, dict) else None
+    except Exception:
+        return None
 
 
 def _maybe_prune(d: str, now: float) -> None:

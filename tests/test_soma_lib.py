@@ -451,7 +451,8 @@ def _pulse(proc, **kw):
         state_dir=str(proc.parent / "state"), **kw)
 
 
-def test_pulse_transition_gate(tmp_path):
+def test_pulse_transition_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOMA_PULSE_HOLD_S", "0")  # the gate itself; hold is covered in test_pulse.py
     healthy = tmp_path / "a"
     healthy.mkdir()
     _fake_proc(healthy)

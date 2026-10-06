@@ -8,6 +8,15 @@ Soma is pre-1.0: minor bumps may include incompatible changes when the cost of c
 
 Next probable: efference-copy tagging (mark strain as self-caused when it follows the agent's own heavy tool calls vs unexplained), and the cheap-sense backlog (inode pct, reboot recency, clock-sync guard, battery/VRAM classes).
 
+## [0.10.1] - 2026-10-06
+
+### Fixed
+- **The pulse reached nobody.** Claude Code does not pass a PostToolUse hook's plain stdout to the model; only `{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}` on stdout (exit 0) does. `soma-pulse.py` printed plain text, so every pulse since the hook was built went unheard (1397 logged emissions on the reference host). It now prints that JSON; `SOMA_PULSE_FORMAT=plain` keeps the old line for harnesses that read stdout (default `json`). The prompt hook keeps plain stdout (UserPromptSubmit works that way).
+- **Flapping.** Silent, a value hovering on a threshold cost nothing (six days on the reference host: HOT toggled 181 times, DRAIN 42, LOAD 30, LOW_MEM 13); audible it would be spam. New `SOMA_PULSE_HOLD_S` (default 300, 0 = off): a flag is announced once, counts as cleared only after staying absent for the hold time without a break, and only then is the recovery announced. A reappearance inside the window is not a transition. Acute flags (OOM, ECC) keep their rule: every appearance announced, clearing never. `pulse_transition()` is the new pure gate; `should_pulse()` is unchanged.
+- **One session ate another's announcement.** The told-state lived in the host-wide `soma-state.json`, so with two sessions (or a subagent) the first tool call consumed the transition. The pulse now parses its stdin and keeps what each session was told in `<state dir>/soma-pulse/<session_id>.json` (shared `write_session_json` / `read_session_json` in `soma_ctx.py`, same atomic write and 3-day pruning as the statusline bridge). The prompt hook records what it told the session, so the next pulse does not repeat it. A new session is seeded from the host's last flag set, so it is not handed a chronic condition as news. With no `session_id` on stdin, or with `soma_ctx.py` absent or older, the pulse falls back to host-wide behaviour (`pulse_held` in `soma-state.json`). A tool call inside a subagent (stdin carries `agent_id`, confirmed in the hooks reference) samples and persists baselines but announces nothing and leaves the session's told-state alone, so the main agent hears the transition itself.
+- **Docs.** Hook `timeout` is in seconds (a 5000 timeout ran a 20 s sleep to completion): README examples now say `2`, not `2000`, with a note. `SOMA_TREND_ANCHOR_S` default is 1800 since 0.9.1; README said 600.
+- Tests: 140 to 169.
+
 ## [0.10.0] - 2026-10-06
 
 The agent feels its own context window and its plan's quota.

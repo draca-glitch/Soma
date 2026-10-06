@@ -44,8 +44,11 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 
 - `soma-state.py` (UserPromptSubmit): orients at prompt time, gated by `SOMA_MODE`.
 - `soma-pulse.py` (PostToolUse): samples mid-turn, while the agent is acting, which is exactly when the agent itself is loading the box. Emits only on a flag **transition** (something appeared, or a chronic condition cleared), so a long healthy turn costs zero lines and a persisting condition is not repeated every tool call. An acute pain flag clearing is just the delta baseline advancing and does not count as a recovery. Gated by `SOMA_PULSE`.
+  - **Output format.** Claude Code does not hand a PostToolUse hook's plain stdout to the model; only `{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}` on stdout reaches it, so the pulse prints that (`SOMA_PULSE_FORMAT=json`, default). `SOMA_PULSE_FORMAT=plain` prints the bare line for harnesses that read stdout. The prompt hook keeps plain stdout, which works for UserPromptSubmit.
+  - **Hold.** A value hovering on a threshold would toggle its flag every few calls. A flag is announced once when it appears; it counts as cleared only after it has stayed absent for `SOMA_PULSE_HOLD_S` seconds (default 300, `0` = off) without a break, and only then is the recovery announced. Acute flags (OOM, ECC) are announced on every appearance, their clearing never.
+  - **Per session.** What each session has been told is kept in `<state dir>/soma-pulse/<session_id>.json`, so with two sessions the first tool call anywhere does not consume a transition the other has yet to hear. A tool call made inside a subagent (the hook input carries `agent_id`) samples and keeps the baselines but announces nothing, so the main agent hears the transition on its own next call. Without a `session_id` on stdin the pulse falls back to one host-wide record.
 
-Both share `soma-state.json` (counter baselines, trend anchor, last flag set), so a condition announced at prompt time is not re-announced by the first pulse.
+Both share `soma-state.json` (counter baselines, trend anchor, last flag set), and a prompt-time emission records what it told its session, so a condition announced at prompt time is not re-announced by the first pulse.
 
 ## Virtualized hosts (VPS)
 
@@ -80,16 +83,16 @@ Drop the hooks somewhere Claude Code can run them (e.g. `~/.claude/hooks/`) and 
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-state.py", "timeout": 2000 }] }
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-state.py", "timeout": 2 }] }
     ],
     "PostToolUse": [
-      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-pulse.py", "timeout": 2000 }] }
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/soma-pulse.py", "timeout": 2 }] }
     ]
   }
 }
 ```
 
-`soma_lib.py` and `soma_ctx.py` must sit beside `soma-state.py`. Python 3.10+, no dependencies.
+The hook `timeout` is in seconds, not milliseconds. `soma_lib.py` and `soma_ctx.py` must sit beside `soma-state.py`. Python 3.10+, no dependencies.
 
 ## Context window
 
@@ -121,6 +124,8 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 |----------|---------|---------|
 | `SOMA_MODE` | `pressure` | `pressure` (quiet unless notable), `always` (emit every turn), `off` |
 | `SOMA_PULSE` | `transition` | mid-turn hook gate: `transition` (emit when a flag appears or a chronic one clears), `off` |
+| `SOMA_PULSE_FORMAT` | `json` | pulse output: `json` (the PostToolUse `additionalContext` envelope, the only form the model receives) or `plain` |
+| `SOMA_PULSE_HOLD_S` | `300` | seconds a chronic flag must stay absent before its recovery is announced; `0` disables the hold |
 | `SOMA_MEM_AVAIL_PCT` | `15` | flag when available RAM drops below this percent of total |
 | `SOMA_SWAP_MB` | `256` | flag when swap-in-use exceeds this many MB |
 | `SOMA_DISK_PCT` | `85` | flag when any watched mount exceeds this percent used |
@@ -137,7 +142,7 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_MEM_TTE_H` | `2` | flag `DRAIN` when RAM would empty within this many hours (and is already below half) |
 | `SOMA_DISK_TTF_H` | `24` | flag `FILL` when a watched mount would fill within this many hours |
 | `SOMA_TOP_GROWTH_GBH` | `0.5` | flag `GROW` when the top process gains private memory faster than this many GB/h; `0` disables |
-| `SOMA_TREND_ANCHOR_S` | `600` | rolling anchor age for rate computation; rates are measured over at least this window |
+| `SOMA_TREND_ANCHOR_S` | `1800` | rolling anchor age for rate computation; rates are measured over at least this window |
 | `SOMA_SELF_RSS_PCT` | `40` | flag `SELF` when the agent's own process tree's private memory exceeds this percent of total RAM; `0` disables |
 | `SOMA_SELF_COMM` | `claude,node` | comm names recognized as the harness ancestor when walking up from the hook |
 | `SOMA_MOUNT_TIMEOUT_MS` | `150` | shared deadline for all mount probes; a probe that misses it reports the mount as numb |
@@ -148,7 +153,7 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_CTX_PCT` | `85` | mark `ctx` `(HIGH)` and emit in pressure mode when the context window is at least this percent full; `0` disables the mark |
 | `SOMA_CTX_MAX_AGE_S` | `86400` | oldest statusline state file the hook still trusts; older falls back to the transcript |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |
-| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json` and `soma-ctx/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
+| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json`, `soma-ctx/` and `soma-pulse/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
 
 ## Relationship to the research
 
