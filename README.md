@@ -38,7 +38,7 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Movement**: rates of change against a rolling anchor (default window 30 min, `SOMA_TREND_ANCHOR_S=1800`): RAM draining toward empty, a mount filling toward full, the top process growing (private memory, so a seeder paging files in does not read as growth). A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
 - **Steal** (virtualized hosts): hypervisor steal share over the trend window; see the VPS section below.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
-- **Context window and quota** (Claude Code, needs the statusline bridge for the full form): how full the agent's own context window is and how much of the plan's rate limit is used, `ctx 87% (866k/1000k)(HIGH) · 5h 7% · 7d 19%`. The window is part of the body too: an agent that knows it is at 87% can save its state before the harness compacts it, and one that sees how much of the five-hour quota is spent knows how much parallel effort is left. `(HIGH)` marks a fill at or past `SOMA_CTX_PCT` (default 85), and in pressure mode the line is emitted on every prompt while the fill is at or above that threshold. The quota figures never make the line emit by themselves; they ride along when something else does (or in `SOMA_MODE=always`). The `5h` and `7d` parts appear only on subscription plans, and a window whose `resets_at` has passed is dropped rather than shown with its old figure. See [Context window](#context-window) for the one-line setup and the fallback.
+- **Context window and quota** (Claude Code, needs the statusline bridge for the full form): how full the agent's own context window is and how much of the plan's rate limit is used, `ctx 87% (866k/1000k)(HIGH) · 5h 7% · 7d 19%`. The window is part of the body too: an agent that knows it is at 87% can save its state before the harness compacts it, and one that sees how much of the five-hour quota is spent knows how much parallel effort is left. `(HIGH)` marks a fill at or past `SOMA_CTX_PCT` (default 85), and in pressure mode the line is emitted on every prompt while the fill is at or above that threshold. The quota figures ride along when something else makes the line emit (or in `SOMA_MODE=always`), with one exception since 0.12.0: a window at 50 % or more projected to run out before it resets (`QUOTA`). The segment also carries the fill rate and the quota projection when they say something, and a model change once (see [Context window](#context-window)). The `5h` and `7d` parts appear only on subscription plans, and a window whose `resets_at` has passed is dropped rather than shown with its old figure. See [Context window](#context-window) for the one-line setup and the fallback.
 
 ## Two hooks, two cadences
 
@@ -117,6 +117,16 @@ The bridge prints nothing and always exits 0, whatever it is fed, so it cannot a
  "seven_day": {"used_pct": 19, "resets_at": 1791723600}}
 ```
 
+Since 0.12.0 the file also carries `samples` (at most 24 `{ts, used_tokens, used_pct, five_pct, seven_pct}`, one per change of `used_tokens`), `model` (plus `model_prev` and `model_changed_ts` after a change), `cost` and `rl_seen`. From these the segment gains a rate when it says something:
+
+```
+ctx 71% (710k/1000k, +6%/turn, ~4 turns left) · 5h 62% (out ~22:10, resets 00:50) · 7d 19%
+... · model claude-opus-5-5 (was claude-fable-5-1 until 20:14)
+ctx 40% (400k/1000k) · cost $41.20
+```
+
+The fill rate is the mean growth over the last up to 3 completed turns, noted by the prompt hook in `soma-turns/<sid>.json`; it is shown only with 2 or more turns, growing, and at most 10 turns to `SOMA_CTX_FULL_PCT`, and a compaction starts the history over. A quota projection appears only when the window runs out before its reset; any doubtful figure (short or non-monotonic history, a reset inside it) prints the plain level. A window at 50 % or more projected to run out raises `QUOTA`, which emits the line in pressure mode. A model change is said once per session (logged as `MODEL`, `QUOTA` likewise). Cost appears only on sessions without rate limits (API billing).
+
 `used_tokens` is input + cache creation + cache read of `current_usage` (null early in a session); `five_hour` and `seven_day` are null on plans without rate limits. Files of sessions that have been silent for three days are pruned during a write, at most once an hour.
 
 The hook trusts a state file for up to `SOMA_CTX_MAX_AGE_S` (default one day). Context only changes on a model call and every model call refreshes the statusline, so an idle session's numbers stay true overnight; the limit only retires a file after the integration was removed or a session is resumed much later.
@@ -176,6 +186,8 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_SERVICES` | *(empty)* | comma-separated services to probe; empty means no `systemctl` call |
 | `SOMA_CTX` | `1` | context-window and rate-limit segment; `0`, `off`, `false`, `no` disable, anything else enables |
 | `SOMA_CTX_PCT` | `85` | mark `ctx` `(HIGH)` and emit in pressure mode when the context window is at least this percent full; `0` disables the mark |
+| `SOMA_CTX_FULL_PCT` | `95` | the fill the `~N turns left` projection counts to |
+| `SOMA_QUOTA` | `1` | quota projection and the `QUOTA` flag; `0`, `off`, `false`, `no` disable |
 | `SOMA_CTX_MAX_AGE_S` | `86400` | oldest statusline state file the hook still trusts; older falls back to the transcript |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |
 | `SOMA_COMPACT` | `1` | compaction awareness (the `soma-compact.py` hook and the notice); `0`, `off`, `false`, `no` disable |

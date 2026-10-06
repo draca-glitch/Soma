@@ -18,7 +18,11 @@ hooks, so this module has two halves:
 State file: <state_dir>/soma-ctx/<session_id>.json
   {"ts": 1791320000, "used_pct": 87, "used_tokens": 865627, "window": 1000000,
    "five_hour": {"used_pct": 7, "resets_at": 1791327000} | null,
-   "seven_day": {"used_pct": 19, "resets_at": 1791723600} | null}
+   "seven_day": {"used_pct": 19, "resets_at": 1791723600} | null,
+   "samples": [{"ts", "used_tokens", "used_pct", "five_pct", "seven_pct"}, ...] (<= 24, 0.12.0),
+   "model": "claude-opus-5-5", "model_prev": ..., "model_changed_ts": ..., "cost": 41.2, "rl_seen": true}
+The prompt hook's own fill-per-turn history: <state_dir>/soma-turns/<session_id>.json
+  {"fills": [[statusline ts, fill pct], ...]} (<= 4), written only by the prompt hook.
 
 Pure stdlib, and deliberately only json/os/time so the statusline writer
 starts fast. Nothing here raises into a hook or a statusline.
@@ -47,6 +51,18 @@ RATE_PCT_MAX = 1000            # a quota can read over 100, but not without boun
 BIG = 1e12                     # token counts and window sizes beyond this are junk
 EPOCH_MS = 1e11                # a resets_at above this is epoch milliseconds
 OFF_VALUES = ("0", "off", "false", "no")
+SAMPLES_MAX = 24               # usage history kept in the state file (one entry per change of used_tokens)
+MODEL_MAX = 128                # a model id longer than this is junk
+COST_MAX = 1e6                 # a session cost above this many dollars is junk
+TURNS_SUBDIR = "soma-turns"    # the prompt hook's per-session fill-per-turn history
+TURNS_KEEP = 4                 # fills kept: the last 3 completed turns
+TURNS_MIN = 2                  # completed turns needed before a rate is shown
+TURNS_SHOW_MAX = 10            # the rate is shown only when this few turns are left
+QUOTA_MIN_SPAN_S = 600         # a quota rate needs at least this much history
+QUOTA_FLAG_PCT = 50            # QUOTA is raised only for a window at least this used
+WINDOW_S = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+NOTICE_MAX_AGE_S = 86400       # a model change older than this is not announced
+DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
 def state_dir(override: str | None = None) -> str:
@@ -114,6 +130,27 @@ def _window(w) -> dict | None:
     return {"used_pct": pct, "resets_at": _epoch(w.get("resets_at"))}
 
 
+def _model_id(x) -> str | None:
+    """A model id worth printing: a short string of visible ASCII, else None."""
+    if isinstance(x, str) and 0 < len(x) <= MODEL_MAX and all(33 <= ord(c) < 127 for c in x):
+        return x
+    return None
+
+
+def _samples(x) -> list:
+    """The stored sample history, keeping only well-formed entries (an older file has none)."""
+    if not isinstance(x, list):
+        return []
+    out = []
+    for s in x[-SAMPLES_MAX:]:
+        if isinstance(s, dict) and _num(s.get("ts")) and _count(s.get("used_tokens")) is not None:
+            out.append({"ts": int(s["ts"]), "used_tokens": int(s["used_tokens"]),
+                        "used_pct": _pct(s.get("used_pct"), CTX_PCT_MAX),
+                        "five_pct": _pct(s.get("five_pct"), RATE_PCT_MAX),
+                        "seven_pct": _pct(s.get("seven_pct"), RATE_PCT_MAX)})
+    return out
+
+
 def write_from_statusline(doc, sdir: str | None = None, now: float | None = None) -> None:
     """Persist the statusline's context and rate-limit numbers for this session. Never raises."""
     try:
@@ -135,8 +172,29 @@ def write_from_statusline(doc, sdir: str | None = None, now: float | None = None
         out = {"ts": int(now), "used_pct": _pct(cw.get("used_percentage"), CTX_PCT_MAX), "used_tokens": used,
                "window": _count(cw.get("context_window_size")),
                "five_hour": _window(rl.get("five_hour")), "seven_day": _window(rl.get("seven_day"))}
-        if all(out[k] is None for k in out if k != "ts"):
+        m = doc.get("model")
+        model = _model_id(m.get("id")) if isinstance(m, dict) else None
+        c = doc.get("cost")
+        cost = c.get("total_cost_usd") if isinstance(c, dict) else None
+        cost = round(cost, 2) if _num(cost) and 0 <= cost <= COST_MAX else None
+        if all(out[k] is None for k in out if k != "ts") and model is None and cost is None:
             return
+        old = read_session_json(CTX_SUBDIR, sid, sdir) or {}
+        samples = _samples(old.get("samples"))
+        if used is not None and (not samples or samples[-1]["used_tokens"] != used):
+            samples.append({"ts": int(now), "used_tokens": used, "used_pct": out["used_pct"],
+                            "five_pct": out["five_hour"]["used_pct"] if out["five_hour"] else None,
+                            "seven_pct": out["seven_day"]["used_pct"] if out["seven_day"] else None})
+        out["samples"] = samples[-SAMPLES_MAX:]
+        prev = _model_id(old.get("model"))
+        out["model"] = model or prev
+        if model and prev and model != prev:
+            out["model_prev"], out["model_changed_ts"] = prev, int(now)
+        elif out["model"] == prev and _model_id(old.get("model_prev")) and _num(old.get("model_changed_ts")):
+            out["model_prev"], out["model_changed_ts"] = old["model_prev"], int(old["model_changed_ts"])
+        out["cost"] = cost
+        # sticky: a session that has carried rate_limits once is a subscription session for good
+        out["rl_seen"] = isinstance(doc.get("rate_limits"), dict) or old.get("rl_seen") is True
         write_session_json(CTX_SUBDIR, sid, out, sdir, now)
     except Exception:
         return
@@ -198,7 +256,7 @@ def _maybe_prune(d: str, now: float) -> None:
     try:
         with os.scandir(d) as it:
             for e in it:
-                if e.name.endswith((".json", ".tmp")) and now - e.stat().st_mtime > PRUNE_AGE_S:
+                if e.name.endswith((".json", ".tmp", ".claim")) and now - e.stat().st_mtime > PRUNE_AGE_S:
                     os.unlink(e.path)
         with open(marker, "w"):
             pass
@@ -276,13 +334,101 @@ def _k(tokens: int) -> str:
     return f"{round(tokens / 1000)}k"
 
 
-def context_segment(hook_input, sdir: str | None = None, now: float | None = None) -> tuple:
-    """('ctx 87% (866k/1000k)(HIGH) · 5h 7% · 7d 19%', high) for this session, or (None, False).
+def _hm(t: float, weekday: bool = False) -> str:
+    """Local HH:MM, with an English weekday (locale independent) when asked."""
+    lt = time.localtime(t)
+    return (DAYS[lt.tm_wday] + " " if weekday else "") + f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
 
-    Off with SOMA_CTX=0|off|false|no. High when the used share reaches SOMA_CTX_PCT (default 85; 0 disables)."""
+
+def _last_compaction(sid: str, doc: dict, sdir: str | None) -> float:
+    """Latest compaction this session is known to have had (0 when none): the compaction
+    record soma_compact keeps, and any drop of used_tokens in the bridge's own samples."""
+    cut = 0.0
+    rec = read_session_json("soma-compact", sid, sdir)
+    if isinstance(rec, dict) and _num(rec.get("ts")):
+        cut = float(rec["ts"])
+    samples = _samples(doc.get("samples"))
+    for a, b in zip(samples, samples[1:]):
+        if b["used_tokens"] < a["used_tokens"]:
+            cut = max(cut, float(b["ts"]))
+    return cut
+
+
+def _turn_rate(sid: str, doc: dict, fill: float, sdir: str | None, record: bool) -> tuple:
+    """(mean fill growth per completed turn in points, turns known) from the prompt hook's own
+    history (<state_dir>/soma-turns/<sid>.json), after noting this prompt's reading when
+    record is set. A reading the history already holds (same statusline ts) is not a new
+    turn; a fill that drops (a compaction) or a reading older than the last one (a clock gone
+    back) starts the history over. Never raises; (None, 0) when there is nothing to say."""
+    try:
+        old = read_session_json(TURNS_SUBDIR, sid, sdir) or {}
+        fills = old.get("fills")
+        fills = [f for f in fills if isinstance(f, list) and len(f) == 2 and _num(f[0]) and _num(f[1])] \
+            if isinstance(fills, list) else []
+        ts = doc.get("ts")
+        if record and _num(ts):
+            if not fills or ts < fills[-1][0] or fill < fills[-1][1]:
+                fills = [[ts, fill]]
+            elif ts > fills[-1][0]:
+                fills = (fills + [[ts, fill]])[-TURNS_KEEP:]
+            write_session_json(TURNS_SUBDIR, sid, {"fills": fills}, sdir)
+        # a compaction since a stored fill makes every delta across it meaningless, even when
+        # the context has grown back past the old fill by the time of the next prompt
+        cut = _last_compaction(sid, doc, sdir)
+        fills = [f for f in fills[-TURNS_KEEP:] if f[0] >= cut]
+        for a, b in zip(fills, fills[1:]):
+            if b[0] <= a[0] or b[1] < a[1]:
+                return None, 0
+        n = len(fills) - 1
+        if n < 1 or not fills or fills[-1][0] != ts:
+            return None, 0
+        return (fills[-1][1] - fills[0][1]) / n, n
+    except Exception:
+        return None, 0
+
+
+def _projection(doc: dict, key: str, pkey: str, wp: int, reset, now: float) -> int | None:
+    """Epoch second at which this quota window runs out at its recent linear rate, or None
+    when the figure would be doubtful: under 2 points or 10 minutes of history, a series that
+    is not strictly later in time and non-decreasing in use, history from before the window's
+    last reset, a reading from the future, a flat or falling rate, or an exhaustion that
+    would not come before the reset."""
+    if reset is None or reset <= now or wp >= 100:
+        return None
+    pts = [(s["ts"], s[pkey]) for s in _samples(doc.get("samples")) if s[pkey] is not None]
+    # the series always ends at the current reading, so quiet time since the last change of
+    # used_tokens lowers the rate instead of being left out of it
+    if not pts or int(doc["ts"]) > pts[-1][0]:
+        pts.append((int(doc["ts"]), wp))
+    elif pts[-1] != (int(doc["ts"]), wp):
+        return None
+    if len(pts) < 2 or pts[-1][0] > now + 60 or pts[0][0] < reset - WINDOW_S[key]:
+        return None
+    for a, b in zip(pts, pts[1:]):
+        if b[0] <= a[0] or b[1] < a[1]:
+            return None
+    span = pts[-1][0] - pts[0][0]
+    if span < QUOTA_MIN_SPAN_S or pts[-1][1] <= pts[0][1]:
+        return None
+    out = pts[-1][0] + (100 - pts[-1][1]) * span / (pts[-1][1] - pts[0][1])
+    return int(out) if now < out < reset else None
+
+
+def context_reading(hook_input, sdir: str | None = None, now: float | None = None) -> dict:
+    """This session's context and quota reading: {"seg": 'ctx 71% (710k/1000k, +6%/turn,
+    ~4 turns left) · 5h 62% (out ~22:10, resets 00:50) · 7d 19%' or None, "high": bool,
+    "quota": bool}.
+
+    Off with SOMA_CTX=0|off|false|no. High when the used share reaches SOMA_CTX_PCT (default 85;
+    0 disables). The fill rate is shown only when it says something (2+ turns, growing, at most
+    10 turns to SOMA_CTX_FULL_PCT, default 95); a quota projection only when the window runs
+    out before it resets, and quota is True when that window is at 50 % or more (SOMA_QUOTA=0
+    turns both off). Cost only on a session that has never carried rate_limits. A main-agent
+    call (no agent_id) notes this prompt's fill as a turn."""
+    res = {"seg": None, "high": False, "quota": False}
     try:
         if os.environ.get("SOMA_CTX", "1").strip().lower() in OFF_VALUES or not isinstance(hook_input, dict):
-            return None, False
+            return res
         now = time.time() if now is None else now
         sid = safe_id(hook_input.get("session_id"))
         doc = (read_state(sid, sdir, now) if sid else None) or {}
@@ -296,13 +442,25 @@ def context_segment(hook_input, sdir: str | None = None, now: float | None = Non
         if pct is not None:
             th = _env_pos_float("SOMA_CTX_PCT", 85.0)
             high = bool(th) and pct >= th
-            size = f" ({_k(tokens)}/{_k(window)})" if tokens and window else ""
-            parts.append(f"ctx {pct}%{size}" + ("(HIGH)" if high else ""))
+            fill = tokens * 100 / window if tokens and window and tokens <= window else float(pct)
+            rate, n = _turn_rate(sid, doc, fill, sdir, not hook_input.get("agent_id"))
+            full = _env_pos_float("SOMA_CTX_FULL_PCT", 95.0)
+            extra = ""
+            if rate and rate > 0 and n >= TURNS_MIN and fill < full:
+                left = math.ceil((full - fill) / rate)
+                if left <= TURNS_SHOW_MAX:
+                    r = round(rate)
+                    extra = (f", +{r}%/turn" if r >= 1 else ", +<1%/turn") \
+                        + f", ~{left} turn{'s' if left != 1 else ''} left"
+            size = f"{_k(tokens)}/{_k(window)}" if tokens and window else ""
+            inner = (size + extra).lstrip(", ")
+            parts.append(f"ctx {pct}%" + (f" ({inner})" if inner else "") + ("(HIGH)" if high else ""))
         else:
             tokens = tokens or transcript_tokens(hook_input.get("transcript_path"))
             if tokens and tokens >= 1000:  # below that "ctx 0k" says nothing
                 parts.append(f"ctx {_k(tokens)}")
-        for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        quota_on = os.environ.get("SOMA_QUOTA", "1").strip().lower() not in OFF_VALUES
+        for key, label, pkey in (("five_hour", "5h", "five_pct"), ("seven_day", "7d", "seven_pct")):
             w = doc.get(key)
             wp = _pct(w.get("used_pct"), RATE_PCT_MAX) if isinstance(w, dict) else None
             if wp is None:
@@ -310,7 +468,47 @@ def context_segment(hook_input, sdir: str | None = None, now: float | None = Non
             reset = _epoch(w.get("resets_at"))
             if reset is not None and reset <= now:
                 continue  # the window has rolled over; its old figure is no longer true
-            parts.append(f"{label} {wp}%")
-        return (" · ".join(parts) or None), high
+            out = _projection(doc, key, pkey, wp, reset, now) if quota_on else None
+            if out is not None:
+                wd = key == "seven_day"
+                parts.append(f"{label} {wp}% (out ~{_hm(out, wd)}, resets {_hm(reset, wd)})")
+                res["quota"] = res["quota"] or wp >= QUOTA_FLAG_PCT
+            else:
+                parts.append(f"{label} {wp}%")
+        cost = doc.get("cost")
+        if doc.get("rl_seen") is False and doc.get("five_hour") is None and doc.get("seven_day") is None \
+                and _num(cost) and 0 < cost <= COST_MAX:
+            parts.append(f"cost ${cost:.2f}")
+        res["seg"], res["high"] = (" · ".join(parts) or None), high
+        return res
     except Exception:
-        return None, False
+        return {"seg": None, "high": False, "quota": False}
+
+
+def context_segment(hook_input, sdir: str | None = None, now: float | None = None) -> tuple:
+    """(segment, high) of context_reading(), the 0.10/0.11 interface."""
+    r = context_reading(hook_input, sdir, now)
+    return r["seg"], r["high"]
+
+
+def take_model_notice(sid, sdir: str | None = None, now: float | None = None) -> str | None:
+    """'model <id> (was <prev> until HH:MM)' when the statusline saw the serving model change,
+    claimed once per change through an exclusive file; None when there is no change, it is
+    older than 24 h, it was already said, or the state is junk. Never raises."""
+    try:
+        s = safe_id(sid)
+        if not s or os.environ.get("SOMA_CTX", "1").strip().lower() in OFF_VALUES:
+            return None
+        now = time.time() if now is None else now
+        doc = read_state(s, sdir, now) or {}
+        model, prev, ts = _model_id(doc.get("model")), _model_id(doc.get("model_prev")), doc.get("model_changed_ts")
+        if not model or not prev or model == prev or not _num(ts) or not 0 <= now - ts <= NOTICE_MAX_AGE_S:
+            return None
+        claim = os.path.join(state_dir(sdir), CTX_SUBDIR, f"{s}.model.{int(ts)}.claim")
+        try:
+            os.close(os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        except OSError:
+            return None
+        return f"model {model} (was {prev} until {_hm(ts)})"
+    except Exception:
+        return None

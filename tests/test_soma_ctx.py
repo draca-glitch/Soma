@@ -50,7 +50,8 @@ def test_writer_sample(tmp_path):
     assert doc["five_hour"] == {"used_pct": 7, "resets_at": 1791327000}
     assert doc["seven_day"] == {"used_pct": 19, "resets_at": 1791723600}
     assert abs(doc["ts"] - time.time()) < 60
-    assert set(doc) == {"ts", "used_pct", "used_tokens", "window", "five_hour", "seven_day"}
+    assert set(doc) == {"ts", "used_pct", "used_tokens", "window", "five_hour", "seven_day",
+                        "samples", "model", "cost", "rl_seen"}  # 0.12.0 history and session facts
 
 
 def test_writer_silent_on_bad_input(tmp_path):

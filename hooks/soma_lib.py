@@ -62,6 +62,21 @@ except Exception:
     def _take_compact_notice(sid, sdir=None, now=None):
         return None
 
+# Rates and session facts (0.12.0), same guard: with the 0.10/0.11 soma_ctx.py the context
+# segment is the level alone, nothing is projected and no model change is announced.
+try:
+    from soma_ctx import context_reading
+except Exception:
+    def context_reading(hook_input, sdir=None, now=None):
+        seg, high = context_segment(hook_input, sdir, now)
+        return {"seg": seg, "high": high, "quota": False}
+
+try:
+    from soma_ctx import take_model_notice as _take_model_notice
+except Exception:
+    def _take_model_notice(sid, sdir=None, now=None):
+        return None
+
 
 PULSE_SUBDIR = "soma-pulse"
 
@@ -795,8 +810,9 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     return the line to print or None to stay silent.
 
     hook_input is the hook's stdin JSON; its session_id and transcript_path
-    feed the context-window segment (soma_ctx). A full context (CTX) makes the
-    line emit in pressure mode, but CTX stays out of last_flags: it is not a
+    feed the context-window segment (soma_ctx). A full context (CTX), a quota projected
+    to run out before its reset (QUOTA) or a model change (MODEL, said once) makes the
+    line emit in pressure mode, but none of them enters last_flags: it is not a
     body condition and must not register as a transition in the pulse hook."""
     if mode == "off":
         return None
@@ -809,24 +825,25 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     events = _session_events(counters, sdoc, host_events) if sid else host_events
     a = assess(state, events=events, trends=trends)
     doc["last_flags"] = sorted(a["flags"])
-    ctx_seg, ctx_high = context_segment(hook_input, state_dir, now) if hook_input else (None, False)
+    ctx = context_reading(hook_input, state_dir, now) if hook_input else {}
+    ctx_seg, ctx_high, quota = ctx.get("seg"), bool(ctx.get("high")), bool(ctx.get("quota"))
     subagent = isinstance(hook_input, dict) and bool(hook_input.get("agent_id"))
-    # a pending compaction notice forces the line like a full context does; it is marked
-    # announced before it is printed, so it is said once and only if that was recorded
+    # a pending compaction notice or model change forces the line like a full context does;
+    # each is marked announced before it is printed, so it is said once and only if recorded
     compact_seg = _take_compact_notice(sid, state_dir, now) if sid and not subagent else None
+    model_seg = _take_model_notice(sid, state_dir, now) if sid and not subagent else None
     line = None
-    if mode == "always" or a["flags"] or ctx_high or compact_seg:
+    if mode == "always" or a["flags"] or ctx_high or quota or compact_seg or model_seg:
         line = render(state, a)
-        if ctx_seg:
-            line += " · " + ctx_seg
-        if compact_seg:
-            line += " · " + compact_seg
+        for seg in (ctx_seg, compact_seg, model_seg):
+            if seg:
+                line += " · " + seg
     # what this session has now been told, so the pulse neither repeats nor misses it
     _record_prompt_told(doc, sid, sdoc, a, line is not None, counters, state_dir, now)
     save_state(doc, state_dir)
     if line:
-        log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set())
-                     | ({"COMPACT"} if compact_seg else set()), state_dir)
+        log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set()) | ({"QUOTA"} if quota else set())
+                     | ({"COMPACT"} if compact_seg else set()) | ({"MODEL"} if model_seg else set()), state_dir)
     return line
 
 
@@ -1017,16 +1034,19 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
         # compaction happens mid-turn, with no prompt after it); taken only when the
         # told-state was written, so a line that will not print never consumes it
         compact_seg = _take_compact_notice(sid, state_dir, now) if told else None
+        model_seg = _take_model_notice(sid, state_dir, now) if told else None
     else:
         appeared, recovered, new_held = pulse_transition(_seed_held(prev), a["flags"], now, hold_s)
         doc["pulse_held"] = new_held
         told = save_state(doc, state_dir)
-        compact_seg = None
-    if (appeared or recovered or compact_seg) and told:
+        compact_seg = model_seg = None
+    if (appeared or recovered or compact_seg or model_seg) and told:
         line = render(state, a)
-        if compact_seg:
-            line += " · " + compact_seg
-        log_emission(line, a["flags"] | ({"COMPACT"} if compact_seg else set()), state_dir, src="pulse")
+        for seg in (compact_seg, model_seg):
+            if seg:
+                line += " · " + seg
+        log_emission(line, a["flags"] | ({"COMPACT"} if compact_seg else set())
+                     | ({"MODEL"} if model_seg else set()), state_dir, src="pulse")
         return line
     return None
 
