@@ -155,7 +155,7 @@ def test_notice_format_once_and_stale(tmp_path):
     sdir, st = _pre_post(tmp_path, summary="")
     seg = soma_compact.take_notice(SID, sdir, time.time())
     hm = time.strftime("%H:%M", time.localtime(st["ts"]))
-    assert seg == (f"compacted {hm} (866k→38k) · dropped: 3 paths, 1 hashes, 1 ids, 1 urls, 1 agents → "
+    assert seg == (f"compacted {hm} (866k→38k) · dropped: 3 paths, 1 hash, 1 id, 1 url, 1 agent → "
                    f"{st['index_file']}")
     assert soma_compact.take_notice(SID, sdir, time.time()) is None
     (tmp_path / "b").mkdir()
@@ -288,3 +288,194 @@ def test_system_reminders_and_meta_not_indexed(tmp_path):
                                      user([{"type": "text", "text": "<system-reminder>/r/e/m</system-reminder>"},
                                            {"type": "text", "text": "typed /real/path/z"}])])
     assert set(soma_compact.build_index(p)["paths"]) == {"/real/path/z"}
+
+
+# --- 0.11.0 pre-release fix round ---------------------------------------------
+
+def _two_spans(now, b1_age=600):
+    span1 = [user("first span /one/a/x.py"), asst([{"type": "text", "text": "abc1234f #111"}], uuid="K1")]
+    span2 = [user("second span /two/b/y.py"), asst([{"type": "text", "text": "fedc4321 #222"}])]
+    return span1 + [boundary(now - b1_age, uuids=["K1"])] + span2
+
+
+def _post(sdir, p, now, summary="summary"):
+    assert soma_compact.handle({"hook_event_name": "PostCompact", "session_id": SID, "transcript_path": p,
+                                "compact_summary": summary}, sdir, now)
+    st = soma_compact.read_state(SID, sdir)
+    return st, Path(st["index_file"]).read_text().split("## User")[0]
+
+
+def test_quick_second_compaction_with_pre_uses_span_two_and_no_old_tokens(tmp_path):
+    sdir, now = str(tmp_path / "state"), time.time()
+    p = write(tmp_path / "t.jsonl", _two_spans(now))
+    assert soma_compact.handle({"hook_event_name": "PreCompact", "session_id": SID, "transcript_path": p}, sdir, now - 5)
+    st, md = _post(sdir, p, now, summary="")
+    assert "/two/b/y.py" in md and "fedc4321" in md and "#222" in md and "/one/a/x.py" not in md
+    assert st["post_tokens"] is None and st["pre_tokens"] != 866000
+
+
+def test_quick_second_compaction_without_pre_uses_previous_state(tmp_path):
+    sdir, now = str(tmp_path / "state"), time.time()
+    p = write(tmp_path / "t.jsonl", _two_spans(now)[:2] + [boundary(now - 600, uuids=["K1"])])
+    _post(sdir, p, now - 599)           # compaction 1, handled by Soma 10 min ago
+    write(p, _two_spans(now))
+    st, md = _post(sdir, p, now)        # compaction 2, its boundary not yet written
+    assert "/two/b/y.py" in md and "#222" in md and "/one/a/x.py" not in md
+    assert st["count"] == 2 and st["post_tokens"] is None and st["pre_tokens"] is None
+
+
+def test_boundary_written_before_post_with_pre_is_fresh(tmp_path):
+    sdir, now = str(tmp_path / "state"), time.time()
+    p = write(tmp_path / "t.jsonl", _two_spans(now))
+    assert soma_compact.handle({"hook_event_name": "PreCompact", "session_id": SID, "transcript_path": p}, sdir, now - 5)
+    write(p, _two_spans(now) + [boundary(now - 2, pre=500000, post=20000, uuids=["K2"]),
+                                asst([{"type": "text", "text": "kept /two/b/y.py"}], uuid="K2")])
+    st, md = _post(sdir, p, now, summary="")
+    assert st["pre_tokens"] == 500000 and st["post_tokens"] == 20000 and "/two/b/y.py" not in md
+
+
+def test_first_compaction_without_pre_uses_window(tmp_path):
+    sdir, now = str(tmp_path / "state"), time.time()
+    p = write(tmp_path / "t.jsonl", _two_spans(now, b1_age=14 * 60))
+    st, md = _post(sdir, p, now)
+    assert "/one/a/x.py" in md and "/two/b/y.py" not in md and st["post_tokens"] == 38000
+
+
+@pytest.mark.parametrize("ts", ["2026-10-06T10:00:00", "not a time", None])
+def test_naive_or_bad_boundary_timestamp_not_fresh(tmp_path, ts):
+    sdir, now = str(tmp_path / "state"), time.time()
+    ents = _two_spans(now)
+    b = boundary(now - 60)
+    b["timestamp"] = ts
+    ents[2] = b
+    p = write(tmp_path / "t.jsonl", ents)
+    st, md = _post(sdir, p, now)
+    assert "/two/b/y.py" in md and "/one/a/x.py" not in md and st["post_tokens"] is None
+
+
+def _dropped(paths_text, summary):
+    idx = soma_compact.new_index()
+    soma_compact.index_text(idx, paths_text)
+    return soma_compact.dropped_of(idx, summary)
+
+
+def test_basename_rule_only_for_unique_files():
+    many = " ".join(f"/var/www/site{i}/index.php" for i in range(20))
+    assert len(_dropped(many, "we edited index.php and the tests")["paths"]) == 20
+    assert not _dropped("/root/work/soma/hooks/soma_ctx.py /a/b/c.txt", "touched soma_ctx.py")["paths"].get(
+        "/root/work/soma/hooks/soma_ctx.py", 0)
+    assert "/root/work/soma/tests" in _dropped("/root/work/soma/tests", "ran the tests")["paths"]
+    assert "/home/u/.bashrc" in _dropped("/home/u/.bashrc", "edited .bashrc")["paths"]
+    assert not _dropped("/root/work/soma/tests", "ran /root/work/soma/tests")["paths"]
+
+
+def test_uuid_and_hex_runs_are_not_hashes():
+    idx = soma_compact.new_index()
+    soma_compact.index_text(idx, "/tmp/claude-0/28b9e108-8897-469c-985e-96b2b9f9aeea/x and "
+                                 "deadbeef1-1234-cafe0 and real eabf4e4")
+    assert sorted(idx["hashes"]) == ["eabf4e4"]
+
+
+def test_css_colours_are_not_ids():
+    idx = soma_compact.new_index()
+    soma_compact.index_text(idx, "a{color:#123456} b{x: #333;}\nborder-color #654321 here\n"
+                                 "see #123 and #7275 in prose; also x#1234 and &#1234; not")
+    assert sorted(idx["ids"]) == ["#123", "#7275"]
+
+
+def test_tool_input_path_value_taken_whole(tmp_path):
+    p = write(tmp_path / "t.jsonl", [asst([{"type": "tool_use", "name": "Read", "input": {
+        "file_path": "/mnt/nas/Onedrive/BRF Ängssätra/x y.pdf", "command": "ls /a/b c",
+        "old_string": "// a comment / here", "new_string": "/* x */ y/z"}}])])
+    idx = soma_compact.build_index(p)
+    assert set(idx["paths"]) == {"/mnt/nas/Onedrive/BRF Ängssätra/x y.pdf", "/a/b"}
+    assert not soma_compact.dropped_of(idx, "read /mnt/nas/Onedrive/BRF Ängssätra/x y.pdf")["paths"].get(
+        "/mnt/nas/Onedrive/BRF Ängssätra/x y.pdf")
+
+
+def test_url_kept_only_as_whole_token():
+    idx = soma_compact.new_index()
+    soma_compact.index_text(idx, "https://github.com/x/y and https://github.com/x/z")
+    d = soma_compact.dropped_of(idx, "see https://github.com/x/y/pull/3 and (https://github.com/x/z).")
+    assert list(d["urls"]) == ["https://github.com/x/y"]
+
+
+def test_lookbehinds_paths_and_ids():
+    idx = soma_compact.new_index()
+    soma_compact.index_text(idx, "~/x/y and s/x/y/g and &#1234; and x#1234 and /real/abs/p")
+    assert list(idx["paths"]) == ["/real/abs/p"] and not idx["ids"]
+
+
+def test_compact_summary_and_interruptions_skipped(tmp_path):
+    p = write(tmp_path / "t.jsonl", [
+        user("This session is being continued /prev/sum/file.py", isCompactSummary=True),
+        user("[Request interrupted by user for tool use]"),
+        user([{"type": "text", "text": "[Request interrupted by user]"}]),
+        user("real typed /typed/a/b")])
+    idx = soma_compact.build_index(p)
+    assert list(idx["paths"]) == ["/typed/a/b"] and idx["user"] == ["real typed /typed/a/b"]
+
+
+def test_parallel_takers_exactly_one_wins(tmp_path):
+    import multiprocessing
+    sdir, now = str(tmp_path / "state"), time.time()
+    _post(sdir, write(tmp_path / "t.jsonl", entries_basic()), now)
+    ctx = multiprocessing.get_context("fork")
+    barrier, q = ctx.Barrier(8), ctx.Queue()
+
+    def taker():
+        barrier.wait()
+        q.put(soma_compact.take_notice(SID, sdir, now + 1))
+
+    procs = [ctx.Process(target=taker) for _ in range(8)]
+    for pr in procs:
+        pr.start()
+    for pr in procs:
+        pr.join(10)
+    got = [q.get(timeout=5) for _ in procs]
+    assert sum(1 for g in got if g) == 1
+
+
+def test_singular_counts_and_modes(tmp_path):
+    sdir, now = str(tmp_path / "state"), time.time()
+    p = write(tmp_path / "t.jsonl", [asst([{"type": "text", "text": "/a/b/c.py eabf4e4 #123 https://x.org/a"}]),
+                                     result("agentId: abcd1234")])
+    st, _ = _post(sdir, p, now, summary="")
+    assert "dropped: 1 path, 1 hash, 1 id, 1 url, 1 agent →" in soma_compact.segment(st)
+    d = tmp_path / "state" / "soma-compact"
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(d / ".pruned").st_mode) == 0o600
+
+
+@pytest.mark.parametrize("kind", ["fifo", "dir"])
+def test_non_regular_transcript_skipped(tmp_path, kind):
+    p = tmp_path / "t.jsonl"
+    os.mkfifo(p) if kind == "fifo" else p.mkdir()
+    for ev in ("PreCompact", "PostCompact"):
+        assert soma_compact.handle({"hook_event_name": ev, "session_id": SID, "transcript_path": str(p)},
+                                   str(tmp_path / "state")) is False
+
+
+def test_pre_index_age_rule(tmp_path):
+    sdir, now = str(tmp_path / "state"), time.time()
+    p = write(tmp_path / "t.jsonl", [user("old /stale/pre/only.py")])
+    soma_compact.handle({"hook_event_name": "PreCompact", "session_id": SID, "transcript_path": p}, sdir,
+                        now - soma_compact.PRE_MAX_AGE_S - 1)
+    write(p, [user("now /now/a/b.py")])
+    _, md = _post(sdir, p, now)
+    assert "/now/a/b.py" in md and "/stale/pre/only.py" not in md
+
+
+def test_cap_limits_listing(tmp_path):
+    sdir, now = str(tmp_path / "state"), time.time()
+    p = write(tmp_path / "t.jsonl", [user(" ".join(f"/cap/d/f{i}.py" for i in range(soma_compact.CLASS_CAP + 7)))])
+    st, md = _post(sdir, p, now, summary="")
+    assert st["dropped"]["paths"] == soma_compact.CLASS_CAP + 7
+    assert md.count("\n- /cap/d/") == soma_compact.CLASS_CAP
+
+
+def test_tokens_shown_only_when_both_known():
+    base = {"ts": time.time(), "count": 1, "dropped": {}, "index_file": "x"}
+    assert "→" not in soma_compact.segment({**base, "pre_tokens": 866000, "post_tokens": None})
+    assert "→" not in soma_compact.segment({**base, "pre_tokens": None, "post_tokens": 38000})
+    assert "(866k→38k)" in soma_compact.segment({**base, "pre_tokens": 866000, "post_tokens": 38000})

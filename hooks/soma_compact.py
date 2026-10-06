@@ -7,16 +7,18 @@ PostCompact diffs that index against the summary and the messages the harness ke
 verbatim, writes the dropped identifiers (plus the user's own messages of the span) to
 an index file, and leaves a pending notice that the prompt hook or the pulse appends
 to the [system-state] line once. Identifiers only: it does not recover reasoning, and
-"kept" means a literal occurrence in the summary or a preserved message.
+"kept" means a whole-token occurrence in the summary or a preserved message (a file path
+also by a basename no other indexed path shares).
 
 Files under <state_dir>/soma-compact/: <sid>.pre.json (PreCompact index), <sid>.json
 (the notice state), <sid>-<epoch>.md (the dropped index, 0600). Pruned after 3 days.
-Pure stdlib (json/os/re/time; datetime for the boundary timestamp). Never raises.
+Pure stdlib (json/os/re/stat/time; datetime for the boundary timestamp). Never raises.
 """
 
 import json
 import os
 import re
+import stat
 import time
 from datetime import datetime
 
@@ -33,11 +35,18 @@ CLASS_CAP = 500
 USER_MSG_CAP = 2000
 USER_MSGS_MAX = 200
 CLASSES = ("paths", "hashes", "ids", "urls", "agents")
+SINGULAR = {"paths": "path", "hashes": "hash", "ids": "id", "urls": "url", "agents": "agent"}
 
 URL_RE = re.compile(r"https?://[^\s\"'<>()\[\]{}`]+")
 PATH_RE = re.compile(r"(?<![\w.~:/\\-])(/[\w.@+-]+(?:/[\w.@+-]+)+)")
-HASH_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
-ID_RE = re.compile(r"(?<![\w&#])#\d{3,7}\b")
+# a UUID is removed before the hash scan; a hash is not cut out of a longer hex-and-dash run
+UUID_RE = re.compile(r"\b(?<![0-9A-Fa-f]-)[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\b(?!-[0-9A-Fa-f])")
+HASH_RE = re.compile(r"\b(?<![0-9A-Fa-f]-)[0-9a-f]{7,40}\b(?!-[0-9A-Fa-f])")
+# not after & or # or a word char, not after ':' or ': ', not followed by ';' or '}' (a CSS value)
+ID_RE = re.compile(r"(?<![\w&#:])(?<!: )#\d{3,7}\b(?![;}])")
+CSS_LINE = re.compile(r"color|background", re.I)
+WHOLE_PATH_HEAD = re.compile(r"/[^/\s*]+/")  # a non-empty first segment: not // or /* code
+URL_CHARS = r"[^\s\"'<>()\[\]{}`]"
 AGENT_RE = re.compile(r"agentId:\s*([A-Za-z0-9_-]{4,64})")
 HASH_DIGIT = re.compile(r"[0-9]")
 HASH_LETTER = re.compile(r"[a-f]")
@@ -66,25 +75,36 @@ def index_text(idx: dict, text: str) -> None:
         p = m.rstrip(".,;:!?")
         if p.count("/") >= 2 and not p.endswith("/"):
             _bump(idx["paths"], p)
-    for m in HASH_RE.findall(rest):
+    for m in HASH_RE.findall(UUID_RE.sub(" ", rest) if "-" in rest else rest):
         if HASH_DIGIT.search(m) and HASH_LETTER.search(m):
             _bump(idx["hashes"], m)
-    for m in ID_RE.findall(rest):
-        _bump(idx["ids"], m)
+    for m in ID_RE.finditer(rest) if "#" in rest else ():
+        if len(m.group()) == 7:  # six digits on a line about colours is a colour
+            a, b = rest.rfind("\n", 0, m.start()) + 1, rest.find("\n", m.end())
+            if CSS_LINE.search(rest[a:b if b >= 0 else len(rest)]):
+                continue
+        _bump(idx["ids"], m.group())
 
 
-def _strings(x, out: list, depth: int = 0) -> list:
-    """Every string value in a tool_use input, recursively (bounded depth)."""
+def whole_path(v: str) -> bool:
+    """A tool input value that is itself an absolute path: taken whole, spaces included."""
+    return (WHOLE_PATH_HEAD.match(v) is not None and "\n" not in v and not v.endswith("/")
+            and len(v) <= 4096)
+
+
+def _strings(x, out: list, paths: list, depth: int = 0, key=None) -> list:
+    """Every string value in a tool_use input, recursively (bounded depth); a value that is
+    itself an absolute path (not a command) goes to paths whole instead."""
     if depth > 20:
         return out
     if isinstance(x, str):
-        out.append(x)
+        (paths if key != "command" and whole_path(x) else out).append(x)
     elif isinstance(x, dict):
-        for v in x.values():
-            _strings(v, out, depth + 1)
+        for k, v in x.items():
+            _strings(v, out, paths, depth + 1, k)
     elif isinstance(x, list):
         for v in x:
-            _strings(v, out, depth + 1)
+            _strings(v, out, paths, depth + 1, key)
     return out
 
 
@@ -102,21 +122,31 @@ def _reinjected(text: str) -> bool:
     return text.lstrip().startswith("<system-reminder>")
 
 
-def entry_texts(e: dict) -> tuple:
-    """(agent-held texts, tool-result texts, human-typed text or None) of one transcript entry."""
+INTERRUPTED_RE = re.compile(r"\[Request interrupted by user[^\]\n]*\]")
+
+
+def _typed(text: str) -> bool:
+    t = text.strip()
+    return bool(t) and not t.startswith("<") and INTERRUPTED_RE.fullmatch(t) is None
+
+
+def entry_texts(e: dict, paths: list | None = None) -> tuple:
+    """(agent-held texts, tool-result texts, human-typed text or None) of one transcript entry;
+    tool input values that are whole absolute paths go to `paths` (or to held without it)."""
     held, results, typed = [], [], None
     msg = e.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
-    if e.get("isMeta"):
-        return held, results, typed  # harness-injected, not something the agent was holding
+    if e.get("isMeta") or e.get("isCompactSummary"):
+        return held, results, typed  # harness-written, not something the agent was holding
     if isinstance(content, str):
         if not _reinjected(content):
             held.append(content)
-        if e.get("type") == "user" and not e.get("isMeta") and not content.lstrip().startswith("<"):
+        if e.get("type") == "user" and _typed(content):
             typed = content
         return held, results, typed
     if not isinstance(content, list):
         return held, results, typed
+    whole = paths if paths is not None else held
     texts, has_result = [], False
     for b in content:
         if not isinstance(b, dict):
@@ -125,14 +155,14 @@ def entry_texts(e: dict) -> tuple:
         if kind == "text" and isinstance(b.get("text"), str) and not _reinjected(b["text"]):
             texts.append(b["text"])
         elif kind == "tool_use":
-            held.extend(_strings(b.get("input"), []))
+            held.extend(_strings(b.get("input"), [], whole))
         elif kind == "tool_result":
             has_result = True
             results.append(_result_text(b.get("content")))
     held.extend(texts)
-    if e.get("type") == "user" and not e.get("isMeta") and not has_result and texts:
+    if e.get("type") == "user" and not has_result and texts:
         joined = "\n".join(texts)
-        if not joined.lstrip().startswith("<"):
+        if _typed(joined):
             typed = joined
     return held, results, typed
 
@@ -144,27 +174,38 @@ def _main_chain(e) -> bool:
 CHUNK = 4 * 1024 * 1024
 
 
+def _regular(path) -> bool:
+    """A regular file (a FIFO with no writer would block open(), as in soma_ctx)."""
+    try:
+        return isinstance(path, str) and stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
 def _read_lines(path, need: int = 2) -> list:
     """Complete lines (bytes) from the transcript's end, read backwards in chunks, stopping
-    once `need` compact boundaries are in hand or READ_MAX_BYTES have been read."""
+    once `need` compact boundaries are in hand or READ_MAX_BYTES have been read. Each chunk
+    is split once; only its complete lines are searched, so the cost stays linear."""
+    if not _regular(path):
+        return []
+    blocks, carry, found = [], b"", 0
     with open(path, "rb") as f:
         size = f.seek(0, os.SEEK_END)
-        pos, data = size, b""
+        pos = size
         while pos > 0 and size - pos < READ_MAX_BYTES:
             step = min(CHUNK, pos, READ_MAX_BYTES - (size - pos))
             pos -= step
             f.seek(pos)
-            chunk = f.read(step)
-            data = chunk + data
-            if b"compact_boundary" in chunk:
-                head = 1 if pos > 0 else 0  # the first line may be partial
-                found = sum(1 for ln in data.split(b"\n")[head:] if _boundary(ln) is not None)
+            parts = (f.read(step) + carry).split(b"\n")
+            carry, block = parts[0], parts[1:]  # the first piece may be a partial line
+            blocks.append(block)
+            if any(b"compact_boundary" in ln for ln in block):
+                found += sum(1 for ln in block if _boundary(ln) is not None)
                 if found >= need:
                     break
-    lines = data.split(b"\n")
-    if pos > 0 and lines:
-        lines = lines[1:]  # a partial first line
-    return [ln for ln in lines if ln.strip()]
+    if pos == 0:
+        blocks.append([carry])  # the file's first line is complete
+    return [ln for block in reversed(blocks) for ln in block if ln.strip()]
 
 
 def _boundary(line: bytes):
@@ -180,8 +221,10 @@ def _boundary(line: bytes):
 
 
 def _boundary_epoch(b: dict) -> float | None:
+    """The boundary's time; None when it is missing, unparseable or naive (no zone)."""
     try:
-        return datetime.fromisoformat(str(b.get("timestamp")).replace("Z", "+00:00")).timestamp()
+        t = datetime.fromisoformat(str(b.get("timestamp")).replace("Z", "+00:00"))
+        return t.timestamp() if t.tzinfo is not None else None
     except Exception:
         return None
 
@@ -201,7 +244,10 @@ def _index_lines(lines) -> dict:
             continue
         if not _main_chain(e):
             continue
-        held, results, typed = entry_texts(e)
+        whole = []
+        held, results, typed = entry_texts(e, whole)
+        for p in whole:
+            _bump(idx["paths"], p)
         for t in held:
             index_text(idx, t)
         for t in results:
@@ -234,7 +280,7 @@ def _dir(sdir) -> str:
 def _atomic(path: str, data: str, mode: int = 0o600) -> bool:
     tmp = f"{os.path.dirname(path)}/.{os.path.basename(path)}.{os.getpid()}.tmp"
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
@@ -271,10 +317,10 @@ def _prune(d: str, now: float) -> None:
     try:
         with os.scandir(d) as it:
             for e in it:
-                if e.name.endswith((".json", ".md", ".tmp")) and now - e.stat().st_mtime > PRUNE_AGE_S:
+                if e.name.endswith((".json", ".md", ".tmp", ".claim")) and now - e.stat().st_mtime > PRUNE_AGE_S:
                     os.unlink(e.path)
-        with open(marker, "w"):
-            pass
+        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600))
+        os.utime(marker)
     except OSError:
         return
 
@@ -288,6 +334,8 @@ def read_state(sid, sdir=None) -> dict | None:
 
 def pre_compact(sid: str, path: str, sdir=None, now: float | None = None) -> bool:
     now = time.time() if now is None else now
+    if not _regular(path):
+        return False
     idx = build_index(path)
     doc = {"ts": now, "tokens": transcript_tokens(path), "index": idx}
     d = _dir(sdir)
@@ -310,8 +358,9 @@ def _preserved_text(lines: list, uuids) -> str:
         except Exception:
             continue
         if isinstance(e, dict):
-            held, results, _ = entry_texts(e)
-            out.extend(held + results)
+            whole = []
+            held, results, _ = entry_texts(e, whole)
+            out.extend(whole + held + results)
     return "\n".join(out)
 
 
@@ -323,24 +372,68 @@ def _occurs(token: str, text: str, lead: str) -> bool:
     return token in text and re.search(lead + re.escape(token) + _TAIL, text) is not None
 
 
-def _kept(cls: str, ident: str, kept: str) -> bool:
+URL_END = r"(?=$|[\s\"'<>()\[\]{}`]|[.,;:!?]+(?:$|[\s\"'<>()\[\]{}`]))"
+
+
+def _file_name(name: str) -> bool:
+    """A file's last segment: it has a dot that is not only a leading one (.bashrc is not)."""
+    return "." in name.lstrip(".")
+
+
+def _kept(cls: str, ident: str, kept: str, shared: frozenset = frozenset()) -> bool:
     if cls == "paths":
-        # the full path, or its basename as a token (also inside a relative mention, dir/name.py)
-        return _occurs(ident, kept, r"(?<![\w.~/-])") or _occurs(os.path.basename(ident), kept, r"(?<![\w.-])")
+        # the full path, or the basename as a token when it is a file's and no other indexed
+        # path shares it (also inside a relative mention, dir/name.py)
+        if _occurs(ident, kept, r"(?<![\w.~/-])"):
+            return True
+        name = os.path.basename(ident)
+        return _file_name(name) and name not in shared and _occurs(name, kept, r"(?<![\w.-])")
     if cls == "ids":
         return re.search(re.escape(ident) + r"(?!\d)", kept) is not None if ident in kept else False
+    if cls == "urls":  # a whole token: a longer URL it is a prefix of does not keep it
+        return ident in kept and re.search(r"(?<![^\s\"'<>()\[\]{}`])" + re.escape(ident) + URL_END, kept) is not None
     return ident in kept  # a short hash kept as part of the full one counts as kept
 
 
-def _fresh_boundary(lines: list, now: float):
-    """(line index, entry) of the last boundary when it is this compaction's (recent), else None."""
+def dropped_of(idx: dict, kept: str) -> dict:
+    """{class: {identifier: count}} of idx's identifiers that kept does not keep."""
+    names = {}
+    for p in (idx.get("paths") or {}):
+        if isinstance(p, str):
+            _bump(names, os.path.basename(p))
+    shared = frozenset(n for n, c in names.items() if c > 1)
+    return {c: {k: n for k, n in (idx.get(c) or {}).items()
+                if isinstance(k, str) and isinstance(n, int) and not _kept(c, k, kept, shared)} for c in CLASSES}
+
+
+def _fresh_boundary(lines: list, now: float, since: float | None = None, strict: bool = False):
+    """(line index, entry) of the last boundary when it is this compaction's, else None.
+    It is when its time is within FRESH_BOUNDARY_S of now and not older than the start of
+    this compaction as Soma knows it (`since`: the pre index's ts less slack, or, strictly
+    newer, the previous notice's ts); with no start known, the window alone decides."""
     bounds = _boundaries(lines)
     if bounds:
         i, b = bounds[-1]
         t = _boundary_epoch(b)
-        if t is not None and abs(now - t) <= FRESH_BOUNDARY_S:
-            return i, b
+        if t is None or abs(now - t) > FRESH_BOUNDARY_S:
+            return None
+        if since is not None and (t <= since if strict else t < since):
+            return None
+        return i, b
     return None
+
+
+PRE_SLACK_S = 5
+
+
+def _compaction_start(pre, prev) -> tuple:
+    """(since, strict) for _fresh_boundary: the pre index's ts minus slack, else the previous
+    notice's ts (a boundary must be strictly newer), else (None, False)."""
+    if pre:
+        return pre["ts"] - PRE_SLACK_S, False
+    if prev and isinstance(prev.get("ts"), (int, float)) and not isinstance(prev.get("ts"), bool):
+        return float(prev["ts"]), True
+    return None, False
 
 
 def _meta_tokens(b) -> tuple:
@@ -378,7 +471,9 @@ def post_compact(sid: str, path, summary, trigger=None, sdir=None, now: float | 
         lines = _read_lines(path) if isinstance(path, str) else []
     except Exception:
         lines = []
-    fresh = _fresh_boundary(lines, now)
+    prev = read_state(sid, sdir)
+    since, strict = _compaction_start(pre, prev)
+    fresh = _fresh_boundary(lines, now, since, strict)
     if pre:
         idx = pre["index"]
     elif lines:
@@ -390,17 +485,16 @@ def post_compact(sid: str, path, summary, trigger=None, sdir=None, now: float | 
         pre_tok = pre["tokens"]
     preserved = meta.get("preservedMessages") if isinstance(meta.get("preservedMessages"), dict) else {}
     kept = (summary if isinstance(summary, str) else "") + "\n" + _preserved_text(lines, preserved.get("uuids"))
-    dropped = {c: {k: n for k, n in (idx.get(c) or {}).items()
-                   if isinstance(k, str) and isinstance(n, int) and not _kept(c, k, kept)} for c in CLASSES}
+    dropped = dropped_of(idx, kept)
     users = [u for u in idx.get("user") or [] if isinstance(u, str)][-USER_MSGS_MAX:]
     index_file = os.path.join(d, f"{sid}-{int(now)}.md")
     if not _atomic(index_file, _render_index(dropped, users, now, trigger)):
         return False
-    prev = read_state(sid, sdir)
     count = (prev.get("count") if prev and isinstance(prev.get("count"), int) else 0) + 1
     doc = {"ts": now, "trigger": trigger if isinstance(trigger, str) else None, "count": count,
            "pre_tokens": pre_tok, "post_tokens": post_tok, "dropped": {c: len(dropped[c]) for c in CLASSES},
-           "index_file": index_file, "transcript": path if isinstance(path, str) else None, "announced": False}
+           "index_file": index_file, "transcript": path if isinstance(path, str) else None, "announced": False,
+           "since": since, "strict": strict}
     ok = _atomic(os.path.join(d, sid + ".json"), json.dumps(doc))
     try:
         os.unlink(pre_path)
@@ -434,7 +528,7 @@ def handle(payload, sdir=None, now: float | None = None) -> bool:
 def _retry_tokens(doc: dict) -> None:
     """post_tokens still unknown: look once at the transcript tail for this compaction's boundary."""
     path = doc.get("transcript")
-    if not isinstance(path, str):
+    if not _regular(path):
         return
     try:
         with open(path, "rb") as f:
@@ -443,7 +537,8 @@ def _retry_tokens(doc: dict) -> None:
             lines = f.read(TAIL_MAX_BYTES).split(b"\n")
     except Exception:
         return
-    fresh = _fresh_boundary(lines, doc["ts"])
+    since = doc.get("since") if isinstance(doc.get("since"), (int, float)) else None
+    fresh = _fresh_boundary(lines, doc["ts"], since, doc.get("strict") is True)
     if fresh:
         pre_tok, post_tok, _ = _meta_tokens(fresh[1])
         doc["post_tokens"] = post_tok
@@ -458,7 +553,7 @@ def segment(doc: dict) -> str:
     if isinstance(pre, int) and isinstance(post, int):
         out += f" ({_k(pre)}→{_k(post)})"
     dropped = doc.get("dropped") if isinstance(doc.get("dropped"), dict) else {}
-    parts = [f"{dropped[c]} {c}" for c in CLASSES if isinstance(dropped.get(c), int) and dropped[c] > 0]
+    parts = [f"{dropped[c]} {c if dropped[c] != 1 else SINGULAR[c]}" for c in CLASSES if isinstance(dropped.get(c), int) and dropped[c] > 0]
     if parts:
         return out + " · dropped: " + ", ".join(parts) + f" → {doc.get('index_file')}"
     return out + " · nothing dropped"
@@ -477,10 +572,22 @@ def take_notice(sid, sdir=None, now: float | None = None) -> str | None:
         now = time.time() if now is None else now
         if now - doc["ts"] > NOTICE_MAX_AGE_S or doc["ts"] - now > 300:
             return None
+        # one caller wins: an exclusive claim per session, compaction count and notice time
+        claim = os.path.join(_dir(sdir), f"{s}.{doc.get('count')}.{int(doc['ts'] * 1000)}.claim")
+        try:
+            os.close(os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        except OSError:
+            return None
         if doc.get("post_tokens") is None:
             _retry_tokens(doc)
         seg = segment(doc)
         doc["announced"] = True
-        return seg if _atomic(os.path.join(_dir(sdir), s + ".json"), json.dumps(doc)) else None
+        if _atomic(os.path.join(_dir(sdir), s + ".json"), json.dumps(doc)):
+            return seg
+        try:
+            os.unlink(claim)  # the mark did not land: a later caller may try again
+        except OSError:
+            pass
+        return None
     except Exception:
         return None

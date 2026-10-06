@@ -130,3 +130,12 @@ def test_hooks_with_soma_compact_end_to_end(tmp_path):
     r = _run(HOOKS / "soma-pulse.py", hi, _quiet_env(sd))
     out = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
     assert " · compacted " in out
+
+
+def test_pulse_marks_announced_only_when_told_state_written(tmp_path, monkeypatch):
+    now = time.time()
+    _compact(tmp_path, now)
+    proc = _proc(tmp_path, "p")
+    monkeypatch.setattr(soma_lib, "_write_session", lambda *a, **k: False)
+    assert _pulse(tmp_path, proc, now + 1, sid=SID) is None
+    assert soma_compact.read_state(SID, str(tmp_path / "state"))["announced"] is False
