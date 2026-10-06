@@ -30,7 +30,15 @@ import threading
 import time
 from pathlib import Path
 
-from soma_ctx import context_segment, state_dir as _ctx_state_dir
+try:
+    from soma_ctx import context_segment, state_dir as _ctx_state_dir
+except Exception:  # missing, broken or older soma_ctx.py: degrade to the 0.9.2 line, never crash a hook
+    def context_segment(hook_input, sdir=None, now=None):
+        return None, False
+
+    def _ctx_state_dir(override=None):
+        return (override or os.environ.get("SOMA_STATE_DIR") or os.environ.get("CLAUDE_KIT_STATE_DIR")
+                or os.path.join(os.path.expanduser("~"), ".claude", "state"))
 
 PAGE_KB = (os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096) / 1024
 

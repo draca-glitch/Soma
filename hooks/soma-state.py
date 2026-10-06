@@ -45,7 +45,7 @@ def main() -> int:
         return 0
     try:
         payload = json.loads(raw) if raw.strip() else None
-    except ValueError:
+    except Exception:  # ValueError, RecursionError on absurd nesting, anything else
         payload = None
     if not isinstance(payload, dict):
         payload = None

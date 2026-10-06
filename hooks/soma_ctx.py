@@ -25,7 +25,9 @@ starts fast. Nothing here raises into a hook or a statusline.
 """
 
 import json
+import math
 import os
+import stat
 import time
 
 CTX_SUBDIR = "soma-ctx"
@@ -39,6 +41,12 @@ PRUNE_AGE_S = 3 * 86400        # state files of sessions silent this long are re
 PRUNE_EVERY_S = 3600           # the prune scan runs at most this often
 TAIL_MAX_BYTES = 4 * 1024 * 1024   # transcript fallback never reads more than this from the end
 TAIL_FIRST_CHUNK = 64 * 1024
+SAFE_ID_MAX = 128              # id + ".json" + ".<id>.<pid>.tmp" must stay under NAME_MAX (255)
+CTX_PCT_MAX = 100              # a context fill outside 0..100 is junk
+RATE_PCT_MAX = 1000            # a quota can read over 100, but not without bound
+BIG = 1e12                     # token counts and window sizes beyond this are junk
+EPOCH_MS = 1e11                # a resets_at above this is epoch milliseconds
+OFF_VALUES = ("0", "off", "false", "no")
 
 
 def state_dir(override: str | None = None) -> str:
@@ -51,7 +59,7 @@ def safe_id(session_id) -> str | None:
     """The session id reduced to [A-Za-z0-9_-] (it becomes a file name), or None when nothing is left."""
     if not isinstance(session_id, str):
         return None
-    out = "".join(c for c in session_id[:256] if c.isascii() and (c.isalnum() or c in "-_"))
+    out = "".join(c for c in session_id[:SAFE_ID_MAX] if c.isascii() and (c.isalnum() or c in "-_"))
     return out or None
 
 
@@ -63,6 +71,34 @@ def _floor(x) -> int | None:
     return int(x // 1) if _num(x) else None
 
 
+def _pct(x, hi) -> int | None:
+    """x floored when it is a number within 0..hi, else None."""
+    return _floor(x) if _num(x) and 0 <= x <= hi else None
+
+
+def _count(x) -> int | None:
+    """A token count or window size: a non-negative, bounded number, else None."""
+    return _floor(x) if _num(x) and 0 <= x <= BIG else None
+
+
+def _epoch(x) -> int | None:
+    """resets_at as epoch seconds; epoch milliseconds are accepted, anything else is None."""
+    if not _num(x) or x < 0:
+        return None
+    if x > EPOCH_MS:
+        x = x / 1000
+    return _floor(x) if x <= EPOCH_MS else None
+
+
+def _env_pos_float(name: str, default: float) -> float:
+    """A finite, non-negative float from the environment, else the default."""
+    try:
+        v = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) and v >= 0 else default
+
+
 def _ctx_path(sid: str, sdir: str | None) -> str:
     return os.path.join(state_dir(sdir), CTX_SUBDIR, sid + ".json")
 
@@ -72,10 +108,10 @@ def _ctx_path(sid: str, sdir: str | None) -> str:
 def _window(w) -> dict | None:
     if not isinstance(w, dict):
         return None
-    pct = _floor(w.get("used_percentage"))
+    pct = _pct(w.get("used_percentage"), RATE_PCT_MAX)
     if pct is None:
         return None
-    return {"used_pct": pct, "resets_at": _floor(w.get("resets_at"))}
+    return {"used_pct": pct, "resets_at": _epoch(w.get("resets_at"))}
 
 
 def write_from_statusline(doc, sdir: str | None = None, now: float | None = None) -> None:
@@ -93,12 +129,12 @@ def write_from_statusline(doc, sdir: str | None = None, now: float | None = None
         cu = cw.get("current_usage")
         used = None
         if isinstance(cu, dict):
-            vals = [cu.get(k) for k in USAGE_KEYS if _num(cu.get(k))]
-            used = int(sum(vals)) if vals else None
+            vals = [cu.get(k) for k in USAGE_KEYS if _count(cu.get(k)) is not None]
+            used = _count(sum(vals)) if vals else None
         rl = doc.get("rate_limits")
         rl = rl if isinstance(rl, dict) else {}
-        out = {"ts": int(now), "used_pct": _floor(cw.get("used_percentage")), "used_tokens": used,
-               "window": _floor(cw.get("context_window_size")),
+        out = {"ts": int(now), "used_pct": _pct(cw.get("used_percentage"), CTX_PCT_MAX), "used_tokens": used,
+               "window": _count(cw.get("context_window_size")),
                "five_hour": _window(rl.get("five_hour")), "seven_day": _window(rl.get("seven_day"))}
         if all(out[k] is None for k in out if k != "ts"):
             return
@@ -124,7 +160,7 @@ def _maybe_prune(d: str, now: float) -> None:
     """Remove state and temp files older than PRUNE_AGE_S, at most once per PRUNE_EVERY_S."""
     marker = os.path.join(d, ".pruned")
     try:
-        if now - os.stat(marker).st_mtime < PRUNE_EVERY_S:
+        if 0 <= now - os.stat(marker).st_mtime < PRUNE_EVERY_S:  # a future mtime counts as due
             return
     except OSError:
         pass
@@ -151,11 +187,7 @@ def read_state(sid: str, sdir: str | None = None, now: float | None = None) -> d
     if not isinstance(doc, dict) or not _num(doc.get("ts")):
         return None
     now = time.time() if now is None else now
-    max_age = CTX_MAX_AGE_S
-    try:
-        max_age = float(os.environ.get("SOMA_CTX_MAX_AGE_S", CTX_MAX_AGE_S))
-    except ValueError:
-        pass
+    max_age = _env_pos_float("SOMA_CTX_MAX_AGE_S", CTX_MAX_AGE_S)
     if now - doc["ts"] > max_age or doc["ts"] - now > 300:
         return None
     return doc
@@ -185,6 +217,8 @@ def transcript_tokens(path, max_bytes: int | None = None) -> int | None:
         return None
     limit = TAIL_MAX_BYTES if max_bytes is None else max_bytes
     try:
+        if not stat.S_ISREG(os.stat(path).st_mode):  # a FIFO with no writer would block open()
+            return None
         with open(path, "rb") as f:
             pos = f.seek(0, 2)
             partial, step, scanned = b"", TAIL_FIRST_CHUNK, 0
@@ -214,37 +248,38 @@ def _k(tokens: int) -> str:
 def context_segment(hook_input, sdir: str | None = None, now: float | None = None) -> tuple:
     """('ctx 87% (866k/1000k)(HIGH) · 5h 7% · 7d 19%', high) for this session, or (None, False).
 
-    Off with SOMA_CTX=0. High when the used share reaches SOMA_CTX_PCT (default 85; 0 disables)."""
+    Off with SOMA_CTX=0|off|false|no. High when the used share reaches SOMA_CTX_PCT (default 85; 0 disables)."""
     try:
-        if os.environ.get("SOMA_CTX", "1") != "1" or not isinstance(hook_input, dict):
+        if os.environ.get("SOMA_CTX", "1").strip().lower() in OFF_VALUES or not isinstance(hook_input, dict):
             return None, False
         now = time.time() if now is None else now
         sid = safe_id(hook_input.get("session_id"))
         doc = (read_state(sid, sdir, now) if sid else None) or {}
         pct, tokens, window = doc.get("used_pct"), doc.get("used_tokens"), doc.get("window")
-        tokens = int(tokens) if _num(tokens) and tokens > 0 else None
-        window = int(window) if _num(window) and window > 0 else None
-        pct = int(pct) if _num(pct) else (tokens * 100 // window if tokens and window else None)
+        tokens = _count(tokens) or None
+        window = _count(window) or None
+        pct = _pct(pct, CTX_PCT_MAX)
+        if pct is None and tokens and window:
+            pct = _pct(tokens * 100 // window, CTX_PCT_MAX)
         parts, high = [], False
         if pct is not None:
-            try:
-                th = float(os.environ.get("SOMA_CTX_PCT", 85))
-            except ValueError:
-                th = 85.0
+            th = _env_pos_float("SOMA_CTX_PCT", 85.0)
             high = bool(th) and pct >= th
             size = f" ({_k(tokens)}/{_k(window)})" if tokens and window else ""
             parts.append(f"ctx {pct}%{size}" + ("(HIGH)" if high else ""))
         else:
             tokens = tokens or transcript_tokens(hook_input.get("transcript_path"))
-            if tokens:
+            if tokens and tokens >= 1000:  # below that "ctx 0k" says nothing
                 parts.append(f"ctx {_k(tokens)}")
         for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
             w = doc.get(key)
-            if not isinstance(w, dict) or not _num(w.get("used_pct")):
+            wp = _pct(w.get("used_pct"), RATE_PCT_MAX) if isinstance(w, dict) else None
+            if wp is None:
                 continue
-            if _num(w.get("resets_at")) and w["resets_at"] <= now:
+            reset = _epoch(w.get("resets_at"))
+            if reset is not None and reset <= now:
                 continue  # the window has rolled over; its old figure is no longer true
-            parts.append(f"{label} {int(w['used_pct'])}%")
+            parts.append(f"{label} {wp}%")
         return (" · ".join(parts) or None), high
     except Exception:
         return None, False

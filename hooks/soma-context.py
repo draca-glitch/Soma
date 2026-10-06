@@ -8,7 +8,7 @@ carries `context_window` (used share, current usage, window size) and, on
 subscription plans, `rate_limits` (five_hour, seven_day). Hooks never see
 those. This command stores them in a small per-session file under the soma
 state directory (<state_dir>/soma-ctx/<session_id>.json, atomic write), and
-soma-state.py renders them as `ctx 87% (866k/1000k) · 5h 7% · 7d 19%`.
+soma-state.py renders them as `ctx 72% (720k/1000k) · 5h 7% · 7d 19%`.
 
 It prints NOTHING and always exits 0, whatever the input: it runs inside
 someone's statusline and must never add output or an error to it.

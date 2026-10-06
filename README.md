@@ -38,7 +38,7 @@ That single line front-loads a fact the agent would otherwise have to go dig for
 - **Movement**: rates of change against a rolling anchor (default 10 min window): RAM draining toward empty, a mount filling toward full, the top process growing (private memory, so a seeder paging files in does not read as growth). A level says "85% used"; a rate says "full in ~6h", which is the form a decision actually needs. Flags: `DRAIN` (empty within `SOMA_MEM_TTE_H` and already below half), `FILL` (full within `SOMA_DISK_TTF_H`), `GROW` (top process gaining over `SOMA_TOP_GROWTH_GBH`). Healthy lines carry no rate annotations; movement only shows when flagged.
 - **Steal** (virtualized hosts): hypervisor steal share over the trend window; see the VPS section below.
 - **Services** (opt-in): `systemctl is-active` over a short watchlist; surfaces any that are not active.
-- **Context window and quota** (Claude Code, needs the statusline bridge for the full form): how full the agent's own context window is and how much of the plan's rate limit is used, `ctx 87% (866k/1000k)(HIGH) · 5h 7% · 7d 19%`. The window is part of the body too: an agent that knows it is at 87% can save its state before the harness compacts it, and one that knows the five-hour quota is nearly spent can hold back on spawning subagents. `(HIGH)` marks a fill at or past `SOMA_CTX_PCT` (default 85), and that crossing alone makes the line emit in pressure mode. The `5h` and `7d` parts appear only on subscription plans, and a window whose `resets_at` has passed is dropped rather than shown with its old figure. See [Context window](#context-window) for the one-line setup and the fallback.
+- **Context window and quota** (Claude Code, needs the statusline bridge for the full form): how full the agent's own context window is and how much of the plan's rate limit is used, `ctx 87% (866k/1000k)(HIGH) · 5h 7% · 7d 19%`. The window is part of the body too: an agent that knows it is at 87% can save its state before the harness compacts it, and one that sees how much of the five-hour quota is spent knows how much parallel effort is left. `(HIGH)` marks a fill at or past `SOMA_CTX_PCT` (default 85), and in pressure mode the line is emitted on every prompt while the fill is at or above that threshold. The quota figures never make the line emit by themselves; they ride along when something else does (or in `SOMA_MODE=always`). The `5h` and `7d` parts appear only on subscription plans, and a window whose `resets_at` has passed is dropped rather than shown with its old figure. See [Context window](#context-window) for the one-line setup and the fallback.
 
 ## Two hooks, two cadences
 
@@ -68,7 +68,7 @@ One sense exists specifically FOR the VPS case: **steal**. `/proc/stat` steal ji
 
 - **Default-quiet.** In the default `pressure` mode, Soma emits *only* when something crosses a threshold. A healthy box stays silent. A layer that narrates the boring case every turn trains the reader to ignore it.
 - **Orient, do not decide.** Soma reports state. What to do about it is the agent's call.
-- **Cheap.** Pure stdlib, reads `/proc`, one `statvfs` per mount, an optional `systemctl` probe only if a watchlist is set. Sub-15ms, no model, no network.
+- **Cheap.** Pure stdlib, reads `/proc`, one `statvfs` per mount, an optional `systemctl` probe only if a watchlist is set. About 60 ms end to end per prompt as a Python process start included (measured on a Ryzen 7 PRO 8700GE with about 500 processes; the `/proc` scan dominates), no model, no network.
 - **Never blocks.** The hook degrades to a partial reading or to silence; it never raises into the prompt path.
 - **Falsifiable.** Every emission is logged (`soma-log.jsonl`) so its value can be measured later, not just asserted.
 
@@ -144,7 +144,7 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_STEAL_PCT` | `10` | flag `STEAL` when hypervisor steal share over the trend window crosses this percent; `0` disables |
 | `SOMA_MOUNTS` | `/,/root/work` | comma-separated mounts to check (duplicate filesystems are deduped) |
 | `SOMA_SERVICES` | *(empty)* | comma-separated services to probe; empty means no `systemctl` call |
-| `SOMA_CTX` | `1` | context-window and rate-limit segment; `0` disables |
+| `SOMA_CTX` | `1` | context-window and rate-limit segment; `0`, `off`, `false`, `no` disable, anything else enables |
 | `SOMA_CTX_PCT` | `85` | mark `ctx` `(HIGH)` and emit in pressure mode when the context window is at least this percent full; `0` disables the mark |
 | `SOMA_CTX_MAX_AGE_S` | `86400` | oldest statusline state file the hook still trusts; older falls back to the transcript |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |
