@@ -77,6 +77,13 @@ except Exception:
     def _take_model_notice(sid, sdir=None, now=None):
         return None
 
+# Workspace senses (0.12.0 part B), same guard: without soma_work.py the line is the plain one.
+try:
+    from soma_work import work_reading
+except Exception:
+    def work_reading(hook_input, table, proc_root="/proc", sdir=None, now=None, pulse=False, self_pid=None):
+        return {"segs": [], "force": False, "flags": set()}
+
 
 PULSE_SUBDIR = "soma-pulse"
 
@@ -163,7 +170,40 @@ def _anon_kb(entry: dict) -> int:
     return entry.get("anon_kb", entry.get("rss_kb", 0))
 
 
-def top_rss(proc_root: str = "/proc") -> dict | None:
+def proc_table(proc_root: str = "/proc") -> dict:
+    """The one /proc walk per hook run: pid -> {ppid, comm, state, start, rss_kb, anon_kb}.
+
+    statm is required (memory); stat is optional (a pid without it has ppid,
+    state and start None and its comm from the comm file). Races (a pid exiting
+    mid-scan) are skipped. Empty dict when /proc cannot be listed."""
+    table = {}
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return table
+    for name in entries:
+        if not name.isdigit():
+            continue
+        base = os.path.join(proc_root, name)
+        try:
+            rss_kb, anon_kb = _statm_kb(Path(base))
+        except (OSError, IndexError, ValueError):
+            continue
+        e = {"ppid": None, "comm": None, "state": None, "start": None, "rss_kb": rss_kb, "anon_kb": anon_kb}
+        try:
+            with open(os.path.join(base, "stat")) as f:
+                stat = f.read()
+            e["comm"] = stat[stat.index("(") + 1:stat.rindex(")")]
+            rest = stat[stat.rindex(")") + 1:].split()
+            e["state"], e["ppid"] = rest[0], int(rest[1])
+            e["start"] = int(rest[19]) if len(rest) > 19 else None
+        except (OSError, ValueError, IndexError):
+            e["ppid"] = None
+        table[int(name)] = e
+    return table
+
+
+def top_rss(proc_root: str = "/proc", table: dict | None = None) -> dict | None:
     """Process holding the most private (anonymous) memory. {name, rss_kb, anon_kb} or None.
 
     Ranks on anonymous memory, not resident set: ranking on resident let an
@@ -171,26 +211,21 @@ def top_rss(proc_root: str = "/proc") -> dict | None:
     win the slot with reclaimable page cache and hide the real consumer.
     Races (pid exiting mid-scan) are skipped, not fatal.
     """
+    table = proc_table(proc_root) if table is None else table
     best = None
-    root = Path(proc_root)
-    try:
-        entries = list(root.iterdir())
-    except OSError:
+    for pid, e in table.items():
+        if best is None or e["anon_kb"] > best[1]["anon_kb"]:
+            best = (pid, e)
+    if best is None:
         return None
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
+    pid, e = best
+    name = e.get("comm")
+    if name is None:
         try:
-            rss_kb, anon_kb = _statm_kb(entry)
-        except (OSError, IndexError, ValueError):
-            continue
-        if best is None or anon_kb > best["anon_kb"]:
-            try:
-                name = (entry / "comm").read_text().strip()
-            except OSError:
-                name = f"pid{entry.name}"
-            best = {"name": name, "rss_kb": rss_kb, "anon_kb": anon_kb}
-    return best
+            name = (Path(proc_root) / str(pid) / "comm").read_text().strip()
+        except OSError:
+            name = f"pid{pid}"
+    return {"name": name, "rss_kb": e["rss_kb"], "anon_kb": e["anon_kb"]}
 
 
 def disk_usage(paths: list, timeout_s: float | None = None) -> dict:
@@ -238,7 +273,7 @@ def disk_usage(paths: list, timeout_s: float | None = None) -> dict:
     return {"mounts": mounts, "numb": numb}
 
 
-def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict | None:
+def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None, table: dict | None = None) -> dict | None:
     """Memory of the agent's own process tree. {name, rss_kb, anon_kb, procs} or None.
 
     The body boundary: 'I am heavy' is a different fact from 'the world is
@@ -251,30 +286,16 @@ def self_tree_rss(proc_root: str = "/proc", self_pid: int | None = None) -> dict
     """
     self_names = set(_env_list("SOMA_SELF_COMM", ["claude", "node"]))
     self_pid = self_pid if self_pid is not None else os.getpid()
-    root = Path(proc_root)
+    table = proc_table(proc_root) if table is None else table
     ppid_of, comm_of, rss_of, anon_of, kids_of = {}, {}, {}, {}, {}
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return None
-    for entry in entries:
-        if not entry.name.isdigit():
+    for pid, e in table.items():
+        if e.get("ppid") is None:
             continue
-        pid = int(entry.name)
-        try:
-            stat = (entry / "stat").read_text()
-            rss_kb, anon_kb = _statm_kb(entry)
-        except (OSError, IndexError, ValueError):
-            continue
-        try:
-            comm = stat[stat.index("(") + 1:stat.rindex(")")]
-            ppid = int(stat[stat.rindex(")") + 1:].split()[1])
-        except (ValueError, IndexError):
-            continue
+        ppid = e["ppid"]
         ppid_of[pid] = ppid
-        comm_of[pid] = comm
-        rss_of[pid] = rss_kb
-        anon_of[pid] = anon_kb
+        comm_of[pid] = e["comm"]
+        rss_of[pid] = e["rss_kb"]
+        anon_of[pid] = e["anon_kb"]
         kids_of.setdefault(ppid, []).append(pid)
     if self_pid not in ppid_of:
         return None
@@ -610,11 +631,13 @@ def gather(proc_root: str = "/proc", mounts: list | None = None, services: list 
         state["load"] = parse_loadavg((Path(proc_root) / "loadavg").read_text())
     except OSError:
         state["load"] = (0.0, 0.0, 0.0)
-    state["top"] = top_rss(proc_root)
+    procs = proc_table(proc_root)
+    state["_procs"] = procs  # shared with the workspace senses; never persisted (roll_state)
+    state["top"] = top_rss(proc_root, table=procs)
     du = disk_usage(mounts)
     state["disks"] = du["mounts"]
     state["numb"] = du["numb"]
-    state["self"] = self_tree_rss(proc_root)
+    state["self"] = self_tree_rss(proc_root, table=procs)
     state["services"] = service_states(services)
     state["temps"] = read_temps(hwmon_root)
     state["psi"] = read_psi(proc_root)
@@ -832,10 +855,12 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     # each is marked announced before it is printed, so it is said once and only if recorded
     compact_seg = _take_compact_notice(sid, state_dir, now) if sid and not subagent else None
     model_seg = _take_model_notice(sid, state_dir, now) if sid and not subagent else None
+    work = (work_reading(hook_input, state.get("_procs"), proc_root, state_dir, now)
+            if hook_input else {"segs": [], "force": False, "flags": set()})
     line = None
-    if mode == "always" or a["flags"] or ctx_high or quota or compact_seg or model_seg:
+    if mode == "always" or a["flags"] or ctx_high or quota or compact_seg or model_seg or work["force"]:
         line = render(state, a)
-        for seg in (ctx_seg, compact_seg, model_seg):
+        for seg in [ctx_seg, compact_seg, model_seg] + work["segs"]:
             if seg:
                 line += " · " + seg
     # what this session has now been told, so the pulse neither repeats nor misses it
@@ -843,7 +868,8 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     save_state(doc, state_dir)
     if line:
         log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set()) | ({"QUOTA"} if quota else set())
-                     | ({"COMPACT"} if compact_seg else set()) | ({"MODEL"} if model_seg else set()), state_dir)
+                     | ({"COMPACT"} if compact_seg else set()) | ({"MODEL"} if model_seg else set())
+                     | work["flags"], state_dir)
     return line
 
 
@@ -1017,6 +1043,7 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
     events = _session_events(counters, sdoc, host_events) if sid and not subagent else host_events
     a = assess(state, events=events, trends=trends)
     doc["last_flags"] = sorted(a["flags"])
+    work = {"segs": [], "force": False, "flags": set()}
     if subagent:
         # the host counters stay where they were: a main agent's first contact (or a caller
         # without a session id) still hears what this call saw and could not announce
@@ -1035,18 +1062,20 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
         # told-state was written, so a line that will not print never consumes it
         compact_seg = _take_compact_notice(sid, state_dir, now) if told else None
         model_seg = _take_model_notice(sid, state_dir, now) if told else None
+        work = (work_reading(hook_input, state.get("_procs"), proc_root, state_dir, now, pulse=True)
+                if told else work)
     else:
         appeared, recovered, new_held = pulse_transition(_seed_held(prev), a["flags"], now, hold_s)
         doc["pulse_held"] = new_held
         told = save_state(doc, state_dir)
         compact_seg = model_seg = None
-    if (appeared or recovered or compact_seg or model_seg) and told:
+    if (appeared or recovered or compact_seg or model_seg or work["force"]) and told:
         line = render(state, a)
-        for seg in (compact_seg, model_seg):
+        for seg in [compact_seg, model_seg] + work["segs"]:
             if seg:
                 line += " · " + seg
         log_emission(line, a["flags"] | ({"COMPACT"} if compact_seg else set())
-                     | ({"MODEL"} if model_seg else set()), state_dir, src="pulse")
+                     | ({"MODEL"} if model_seg else set()) | work["flags"], state_dir, src="pulse")
         return line
     return None
 

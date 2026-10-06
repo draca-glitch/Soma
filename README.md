@@ -151,6 +151,16 @@ The **index file** (Markdown, mode 0600 because it holds the user's words) lists
 
 **Limits, plainly.** It recovers identifiers, not reasoning: why a path mattered is gone with the summary. "Kept" means a literal occurrence in the summary or in a preserved message (as a whole token: a URL is not kept by a longer URL it begins; a short hash is kept by the full one; a file path is also kept by its basename, but only when that basename has a dot that is not just a leading one and no other indexed path shares it, so twenty `index.php` files or a directory such as `/x/tests` are kept only by their full path), so an identifier the summary paraphrases counts as dropped, and one it mentions in passing counts as kept. State lives in `soma-compact/` under the state directory (`<sid>.pre.json`, `<sid>.json`, `<sid>-<epoch>.md`), pruned after three days. `SOMA_COMPACT=0` turns all of it off.
 
+## Workspace
+
+Three senses about the place the agent works in, not the machine (0.12.0). All three come from the process table the hook already reads once per run and from the git directory of the session's `cwd` (read directly, no `git` subprocess), and all three are per session: a subagent's tool call reads and records nothing.
+
+- **Peer sessions**: `peers 1 here (3 sessions)`. A session is a live process named `claude` (`SOMA_PEER_COMM`) with no such process above it, neither a zombie nor stopped; this session's own root is the topmost one above the hook, so a headless `claude -p` it started is not a peer, and a peer's headless children are not sessions of their own. The count in parentheses includes this session. "Here" means the same git toplevel as this session's `cwd` (else the same directory), judged by the peer's root process working directory; an unreadable one counts as elsewhere. Shown only when at least one peer is here. When that count goes from 0 to more, **`PEER`** forces the line once (claimed, logged, kept out of `last_flags`); later lines carry the segment only when they are printed anyway. Known limit: a peer launched in another directory that `cd`s into this checkout is not seen as here (it under-reports, it never invents one).
+- **HEAD moved**: `HEAD main→plan-06 since last prompt` (in the pulse: `since last tool call`). Each session records its toplevel and the ref HEAD points at (`.git/HEAD`, following a worktree's `gitdir:` file; a detached HEAD is the hash's first 7 characters). A different ref than recorded is said once (**`HEAD`**, forces the line, claimed, logged, kept out of `last_flags`). A commit on the same branch is not a change. In the pulse, a Bash command that mentions `git` is taken as the agent's own doing and recorded silently; a move after any other tool call, or one a subagent made, is said. Moving to another toplevel, or out of git, records silently.
+- **Own leftovers**: `bg 2 (oldest 47m php)`, processes this session started through the Bash tool that still run `SOMA_BG_AGE_S` (600) seconds after they started: a forgotten dev server, a queue worker, a background loop. The discriminator is the `CLAUDE_PID` variable Claude Code puts in the Bash tool's environment, and only there (its MCP servers, hooks and statusline do not carry it), compared with this session's root pid, plus a start time after the root's (pid reuse). Only processes under the session root or reparented to init are looked at; a process and its marked descendants count once; a shell wrapper is named by its one child when that child is as old. It is a heuristic: it never forces a line and raises no flag. It only works where the hook may read other processes' `environ` (same user or root); elsewhere it stays silent.
+
+State: `soma-work/<sid>.json` under the state directory (`{ts, top, head, peers}`, rewritten only when one of them changes), claims next to it, pruned after three days with the other per-session files. `SOMA_PEERS=0`, `SOMA_HEAD=0`, `SOMA_BG=0` turn each off; with no peer here, no move and no leftover the line is byte-identical to before.
+
 ## Configuration
 
 All thresholds are `SOMA_*` environment variables. Defaults are tuned for a large-RAM workstation/server; lower them on small boxes.
@@ -191,7 +201,12 @@ All thresholds are `SOMA_*` environment variables. Defaults are tuned for a larg
 | `SOMA_CTX_MAX_AGE_S` | `86400` | oldest statusline state file the hook still trusts; older falls back to the transcript |
 | `SOMA_LOG` | `1` | append each emission to the log; `0` disables |
 | `SOMA_COMPACT` | `1` | compaction awareness (the `soma-compact.py` hook and the notice); `0`, `off`, `false`, `no` disable |
-| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json`, `soma-ctx/`, `soma-pulse/` and `soma-compact/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
+| `SOMA_PEERS` | `1` | peer sessions and the `PEER` flag; `0`, `off`, `false`, `no` disable |
+| `SOMA_PEER_COMM` | `claude` | comma-separated process names that count as a session root |
+| `SOMA_HEAD` | `1` | HEAD-moved notice and the `HEAD` flag; `0`, `off`, `false`, `no` disable |
+| `SOMA_BG` | `1` | own leftovers segment; `0`, `off`, `false`, `no` disable |
+| `SOMA_BG_AGE_S` | `600` | minimum age in seconds before a Bash-started process counts as left over |
+| `SOMA_STATE_DIR` | `~/.claude/state` | where `soma-log.jsonl`, `soma-state.json`, `soma-ctx/`, `soma-pulse/`, `soma-compact/` and `soma-work/` are written (falls back to `CLAUDE_KIT_STATE_DIR`) |
 
 ## Relationship to the research
 
