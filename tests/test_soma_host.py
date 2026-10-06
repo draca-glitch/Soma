@@ -399,3 +399,41 @@ def test_probe_interval_through_the_hook_state(tmp_path, monkeypatch):
     assert _state(tmp_path)["net_probe"] == {"//nas/public": 1000.0}
     _line(tmp_path, proc, now=1031.0)
     assert len(calls) == 2
+
+
+def test_stamp_reread_from_disk_just_before_probing():
+    calls, e = [], [("//nas/public", "/mnt/nas")]
+    probe = calls.append
+
+    def stamp(s):
+        calls.append("stamp")
+    # another hook stamped the source while this one was starting: no probe, the last result stands
+    st, rec = {}, {}
+    out = soma_host.stale_mounts(e, rec, 1000.0, probe=probe, timeout_s=0.1, stamps=st, interval_s=30,
+                                 stamp=stamp, reread=lambda: {"//nas/public": 999.98})
+    assert calls == [] and out == ([], {})
+    # nothing on disk either: probes
+    soma_host.stale_mounts(e, {}, 1000.0, probe=probe, timeout_s=0.1, stamps={}, interval_s=30,
+                           stamp=stamp, reread=lambda: {})
+    assert calls == ["stamp", "/mnt/nas"]
+    # nothing due: no read at all
+    reads = []
+    soma_host.stale_mounts(e, {}, 1001.0, probe=probe, timeout_s=0.1, stamps={"//nas/public": 1000.0},
+                           interval_s=30, stamp=stamp, reread=lambda: reads.append(1) or {})
+    assert reads == [] and len(calls) == 2
+
+
+def test_a_parallel_hooks_stamp_on_disk_stops_the_probe(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(soma_host, "PROBE", lambda p: calls.append(p))
+    proc = _proc(tmp_path, mounts="//nas/public /mnt/nas cifs ro 0 0\n")
+    real_roll = soma_lib.roll_state
+
+    def roll(prev, state, now):  # the other hook stamps after this one has read the state
+        fresh = soma_lib.load_state(str(tmp_path / "st"))
+        fresh["net_probe"] = {"//nas/public": now - 0.02}
+        soma_lib.save_state(fresh, str(tmp_path / "st"))
+        return real_roll(prev, state, now)
+    monkeypatch.setattr(soma_lib, "roll_state", roll)
+    _line(tmp_path, proc, now=1000.0)
+    assert calls == []

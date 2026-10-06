@@ -117,11 +117,19 @@ def _read_regular(path: str) -> str | None:
         os.close(fd)
 
 
-def _git_dir(top: str) -> str | None:
+def _git_dir(top: str, net=()) -> str | None:
+    """The git directory of top: .git itself, the target of a symlinked .git, or a gitdir:
+    pointer's target; each resolved by string before any os call on it, so one that leads under
+    a mount in net reads as no repo."""
     dot = os.path.join(top, ".git")
     try:
-        st = os.stat(dot)
+        st = os.lstat(dot)
+        if stat.S_ISLNK(st.st_mode):
+            dot = resolve(dot, net)
+            st = os.stat(dot) if dot else None
     except OSError:
+        return None
+    if st is None:
         return None
     if stat.S_ISDIR(st.st_mode):
         return dot
@@ -129,7 +137,7 @@ def _git_dir(top: str) -> str | None:
     if not line or not line.strip().startswith("gitdir:"):
         return None
     path = line.strip()[len("gitdir:"):].strip()
-    return os.path.normpath(os.path.join(top, path))
+    return resolve(os.path.normpath(os.path.join(os.path.dirname(dot), path)), net)
 
 
 def resolve(path, net=()) -> str | None:
@@ -187,11 +195,11 @@ def toplevel(cwd: str, net=()) -> str | None:
     return None
 
 
-def head_ref(top: str) -> str | None:
+def head_ref(top: str, net=()) -> str | None:
     """The branch HEAD points at (refs/heads/ stripped), or the first 7 characters of a detached
     hash; None when HEAD is missing, empty, not a regular file or unparseable."""
     try:
-        gd = _git_dir(top)
+        gd = _git_dir(top, net)
         head = _read_regular(os.path.join(gd, "HEAD")) if gd else None
         head = head.strip() if head else ""
         if head.startswith("ref:"):
@@ -211,7 +219,7 @@ def git_head(cwd, net=()) -> tuple | None:
     try:
         real = resolve(cwd, net)
         top = toplevel(real, net) if real else None
-        ref = head_ref(top) if top else None
+        ref = head_ref(top, net) if top else None
         return (top, ref) if ref else None
     except Exception:
         return None
@@ -444,7 +452,7 @@ def work_reading(hook_input, table, proc_root: str = "/proc", sdir=None, now=Non
         peer_new = False
         if _on("SOMA_HEAD") and cwd and not under(cwd, net):
             top = mine()
-            ref = head_ref(top) if top else None
+            ref = head_ref(top, net) if top else None
             if top and ref is None:
                 pass  # HEAD unreadable or half-written: keep the last good record, say nothing
             else:

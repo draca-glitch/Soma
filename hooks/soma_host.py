@@ -151,15 +151,17 @@ def probe_interval_s() -> float:
 
 
 def stale_mounts(mounts: list, record, now: float, probe=None, timeout_s: float | None = None,
-                 stamps: dict | None = None, interval_s: float = 0.0, stamp=None) -> tuple:
+                 stamps: dict | None = None, interval_s: float = 0.0, stamp=None, reread=None) -> tuple:
     """(stale [mount points], new record {source: time of the last probe that hung}).
 
     mounts: mount points, or (source, mount point) pairs; one probe per source (its first mount
     point), the answer applied to all its mount points. A source in the record probed less than
     STALE_BACKOFF_S ago is not probed again and stays stale. With stamps (a dict {source: time of
     the last probe attempt}, updated in place), a source attempted less than interval_s ago is not
-    probed and its last result stands; due sources are stamped, and stamp(stamps) is called,
-    BEFORE the probe, so parallel hooks do not all probe in the same second. A record time in the
+    probed and its last result stands. When a probe looks due, reread() (the stamps on disk now,
+    one small read) is consulted first, since stamps were read at hook start: a source another
+    hook stamped meanwhile is not probed. Due sources are stamped, and stamp(stamps) is called,
+    BEFORE the probe; a hook starting while another probes may still probe once. A record time in the
     future (clock went backwards) or junk means probe now. Sources no longer listed drop out."""
     probe = PROBE if probe is None else probe
     timeout_s = _timeout_s() if timeout_s is None else timeout_s
@@ -179,6 +181,18 @@ def stale_mounts(mounts: list, record, now: float, probe=None, timeout_s: float 
                 new[src] = t  # a probe is due elsewhere; the last result stands
         else:
             to_probe.append(src)
+    if to_probe and reread is not None and isinstance(stamps, dict):
+        try:
+            disk = reread()
+        except Exception:
+            disk = None
+        disk = disk if isinstance(disk, dict) else {}
+        for src in [x for x in to_probe if _valid_ts(disk.get(x)) and 0 <= now - disk[x] < interval_s]:
+            to_probe.remove(src)
+            stamps[src] = disk[src]
+            t = record.get(src)
+            if _valid_ts(t) and 0 <= now - t:
+                new[src] = t  # another hook is probing it; the last result stands
     if isinstance(stamps, dict):
         for k in [k for k in stamps if k not in first]:
             del stamps[k]
@@ -240,7 +254,7 @@ def reboot_pending() -> bool:
         return False
 
 
-def host_reading(proc_root: str, table, record, now: float, stamps=None, stamp=None) -> dict:
+def host_reading(proc_root: str, table, record, now: float, stamps=None, stamp=None, reread=None) -> dict:
     """{stale, record, stamps, net, pkg, reboot}; never raises (a failing piece reads as healthy).
     net: every network mount point (discovered, plus any SOMA_NET_MOUNTS entries), for the
     workspace senses to stay off."""
@@ -258,7 +272,8 @@ def host_reading(proc_root: str, table, record, now: float, stamps=None, stamp=N
             st = dict(stamps) if isinstance(stamps, dict) else {}
             st = {k: v for k, v in st.items() if _valid_ts(v)}
             out["stale"], out["record"] = stale_mounts(entries, record, now, stamps=st,
-                                                       interval_s=probe_interval_s(), stamp=stamp)
+                                                       interval_s=probe_interval_s(), stamp=stamp,
+                                                       reread=reread)
             out["stamps"] = st
     except Exception:
         pass

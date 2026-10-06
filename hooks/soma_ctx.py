@@ -68,7 +68,9 @@ SERIES_MAX = 24                # ... and at most this many points (two hours)
 QUOTA_MIN_SPAN_S = 900         # a quota rate needs at least this much history
 QUOTA_MIN_RISE = 5             # ... rising at least this many points over it (whole percentages)
 QUOTA_BURST_RISE = 3           # the recent third leads the rate only when it alone rises this much
-QUOTA_FRESH_S = 600            # a series whose newest point is older than this projects nothing
+QUOTA_FRESH_S = 1800           # a series whose newest point is older than this projects nothing
+QUOTA_DIP = 2                  # the 5-hour use falling this many points means the window rolled over
+RESET_SLACK_S = 300            # resets_at moving by at most this much is the same window
 QUOTA_FLAG_PCT = 50            # QUOTA is raised only for a window at least this used
 WINDOW_S = 5 * 3600            # the five-hour window (the only one projected)
 NOTICE_MAX_AGE_S = 86400       # a model change older than this is not announced
@@ -169,19 +171,34 @@ def _series(x) -> list:
             if isinstance(p, dict) and _num(p.get("ts")) and _pct(p.get("pct"), RATE_PCT_MAX) is not None]
 
 
-def _next_series(old: dict, fh, now: float) -> list:
-    """The 5-hour series after this reading: a point at most every SERIES_STEP_S, started over
-    when the window resets (its use falls or its resets_at changes) or the clock goes back."""
+def _next_series(old: dict, fh, now: float) -> tuple:
+    """(series, resets_at, doubt): the 5-hour series after this reading, a point at most every
+    SERIES_STEP_S. Started over only when the window has really rolled over: resets_at later by
+    more than RESET_SLACK_S, use down QUOTA_DIP points or more, or the clock gone back. A smaller
+    move of resets_at keeps the series (the newest value is stored); a 1-point dip is jitter (kept,
+    not appended); a reading without the window changes nothing. resets_at earlier by more than
+    RESET_SLACK_S keeps the series in doubt (no projection) until the next refresh agrees."""
     series = _series(old.get("five_series"))
+    ref = old.get("five_reset")
+    if not _num(ref):  # a file from before this field: the previous reading's window
+        ofh = old.get("five_hour")
+        ref = ofh.get("resets_at") if isinstance(ofh, dict) else None
+    ref = ref if _num(ref) else None
+    doubt = old.get("five_doubt") is True
     if not fh:
-        return series
-    ofh = old.get("five_hour")
-    if series and (fh["used_pct"] < series[-1]["pct"] or now < series[-1]["ts"]
-                   or not isinstance(ofh, dict) or ofh.get("resets_at") != fh["resets_at"]):
-        series = []
-    if not series or now - series[-1]["ts"] >= SERIES_STEP_S:
+        return series, ref, doubt
+    new = fh["resets_at"] if _num(fh["resets_at"]) else None
+    moved = new - ref if new is not None and ref is not None else 0
+    if series and (moved > RESET_SLACK_S or fh["used_pct"] <= series[-1]["pct"] - QUOTA_DIP
+                   or now < series[-1]["ts"]):
+        series, doubt = [], False
+    elif moved < -RESET_SLACK_S:
+        doubt = True
+    elif new is not None:
+        doubt = False
+    if not series or (now - series[-1]["ts"] >= SERIES_STEP_S and fh["used_pct"] >= series[-1]["pct"]):
         series.append({"ts": int(now), "pct": fh["used_pct"]})
-    return series[-SERIES_MAX:]
+    return series[-SERIES_MAX:], new if new is not None else ref, doubt
 
 
 def write_from_statusline(doc, sdir: str | None = None, now: float | None = None) -> None:
@@ -219,7 +236,7 @@ def write_from_statusline(doc, sdir: str | None = None, now: float | None = None
                             "five_pct": out["five_hour"]["used_pct"] if out["five_hour"] else None,
                             "seven_pct": out["seven_day"]["used_pct"] if out["seven_day"] else None})
         out["samples"] = samples[-SAMPLES_MAX:]
-        out["five_series"] = _next_series(old, out["five_hour"], now)
+        out["five_series"], out["five_reset"], out["five_doubt"] = _next_series(old, out["five_hour"], now)
         prev = _model_id(old.get("model"))
         out["model"] = model or prev
         out["model_first"] = _model_id(old.get("model_first")) or prev or model
@@ -439,9 +456,10 @@ def _projection(doc: dict, wp: int, reset, now: float) -> int | None:
     non-decreasing in use, starts inside the current window, spans QUOTA_MIN_SPAN_S, rises
     QUOTA_MIN_RISE points and has a newest point at most QUOTA_FRESH_S old and not from the
     future. The rate is the higher of the whole span's and, when it alone rises
-    QUOTA_BURST_RISE points, the most recent third's (pessimistic on purpose). None also for
-    a run-out that is past or would not come before the reset."""
-    if reset is None or reset <= now or wp >= 100:
+    QUOTA_BURST_RISE points, the most recent third's (pessimistic after a burst; at a steady slow
+    rate whole percentages can make it run late). None also for a run-out that is past or would
+    not come before the reset, or while a resets_at that moved earlier waits for agreement."""
+    if reset is None or reset <= now or wp >= 100 or doc.get("five_doubt") is True:
         return None
     pts = [(p["ts"], p["pct"]) for p in _series(doc.get("five_series"))]
     if len(pts) < 2 or not 0 <= now - pts[-1][0] <= QUOTA_FRESH_S or pts[0][0] < reset - WINDOW_S:

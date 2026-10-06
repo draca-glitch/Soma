@@ -90,7 +90,7 @@ except Exception:
 try:
     from soma_host import host_reading
 except Exception:
-    def host_reading(proc_root, table, record, now, stamps=None, stamp=None):
+    def host_reading(proc_root, table, record, now, stamps=None, stamp=None, reread=None):
         return {"stale": [], "record": {}, "stamps": {}, "net": [], "pkg": None, "reboot": False}
 
 PULSE_SUBDIR = "soma-pulse"
@@ -1026,8 +1026,11 @@ def _sample(proc_root, mounts, services, hwmon_root, sys_root, state_dir, now):
         fresh["net_probe"] = dict(stamps)
         save_state(fresh, state_dir)
 
+    def reread():  # stamps another hook wrote since this one read the state
+        return load_state(state_dir).get("net_probe")
+
     host = host_reading(proc_root, state.get("_procs"), prev.get("stale"), now,
-                        prev.get("net_probe"), stamp)
+                        prev.get("net_probe"), stamp, reread)
     state["stale"], state["pkg"], state["reboot"] = host["stale"], host["pkg"], host["reboot"]
     state["_net"] = list(host.get("net") or []) + list(host["stale"])
     if host["record"]:

@@ -569,3 +569,41 @@ def test_hook_and_statusline_children_are_not_leftovers_but_detached_work_is(tmp
     root = _proc(tmp_path, procs)
     bg = soma_work.leftovers(soma_lib.proc_table(root), root, 901, 600)
     assert bg is not None and bg["count"] == 1 and bg["name"] == "node"
+
+
+def test_a_git_link_or_gitdir_into_a_network_mount_reads_as_no_repo(tmp_path, monkeypatch):
+    nas = tmp_path / "nas"
+    _git(nas / "real")
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / ".git").symlink_to(nas / "real" / ".git")             # a symlinked .git
+    b = tmp_path / "b"
+    b.mkdir()
+    (b / ".git").write_text(f"gitdir: {nas / 'real' / '.git'}\n")  # an absolute gitdir: pointer
+    c = tmp_path / "c"
+    c.mkdir()
+    (c / ".git").write_text("gitdir: ../nas/real/.git\n")      # a relative one
+    d = tmp_path / "d"
+    d.mkdir()
+    (tmp_path / "hop").symlink_to(nas)                          # a local link that leads into it
+    (d / ".git").write_text(f"gitdir: {tmp_path / 'hop' / 'real' / '.git'}\n")
+    seen = _record_fs(monkeypatch)
+    for top in (a, b, c, d):
+        assert soma_work.git_head(str(top), [str(nas)]) is None, top
+        assert soma_work.head_ref(str(top), [str(nas)]) is None, top
+    assert [p for p in seen if p == str(nas) or p.startswith(str(nas) + "/")] == []
+    assert soma_work.git_head(str(b), [])[1] == "main"          # the same repos read fine without the mount
+
+
+def test_under_is_a_path_boundary_not_a_prefix():
+    assert soma_work.under("/mnt/nas", ["/mnt/nas"]) and soma_work.under("/mnt/nas/x", ["/mnt/nas/"])
+    assert not soma_work.under("/mnt/nas2", ["/mnt/nas"])
+    assert not soma_work.under("/mnt/nas2/x", ["/mnt/nas"])
+
+
+def test_toplevel_walk_stops_after_max_levels(tmp_path):
+    repo = _git(tmp_path / "r")
+    ok = repo.joinpath(*["d"] * 39)
+    ok.mkdir(parents=True)
+    assert soma_work.toplevel(str(ok)) == str(repo)             # 40 levels: the repo itself is the 40th
+    assert soma_work.toplevel(str(ok / "d")) is None            # 41: past the limit

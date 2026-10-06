@@ -204,7 +204,7 @@ def test_projection_doubtful_cases_plain(tmp_path):
         _series((N - 1800, 50), (N - 2000, 56), (N, 62)),       # timestamps out of order
         _series((N - 3 * 3600, 20), (N - 900, 56), (N, 62)),    # spans the previous reset
         _series((N - 1800, 62), (N, 62)),                       # flat
-        _series((N - 2400, 50), (N - 1300, 56), (N - 700, 62)),  # newest point 700 s old: stale
+        _series((N - 3600, 50), (N - 2700, 56), (N - 1900, 62)),  # newest point 1900 s old: stale
         "junk", [{"ts": "x", "pct": 1}, None],
     ]
     for s in cases:
@@ -546,3 +546,95 @@ def test_model_notice_away_and_back(tmp_path):
     soma_ctx.write_from_statusline(_sl(34, model="m-a"), sd, N + 9)  # and back, same second again
     assert soma_ctx.take_model_notice(SID, sd, N + 10) == f"model m-a (was m-b until {_hm(N + 9)})"
     assert soma_ctx.take_model_notice(SID, sd, N + 11) is None
+
+
+# --- 0.12.0 fix round 2: a series that survives real statusline data -------------------------
+
+def _shows(sd, now):
+    return "out ~" in (soma_ctx.context_reading({"session_id": SID}, str(sd), now)["seg"] or "")
+
+
+def _sim_first(sd, jitter=False, miss=0):
+    """30 points/hour from 20 %, a statusline refresh every 60 s and a prompt every 120 s for an
+    hour; the index of the first prompt that prints a projection, or None."""
+    reset, prompts = N + 4 * 3600, []
+    for k, t in enumerate(range(0, 3601, 60), 1):
+        fr = reset + ((1, -1)[k % 2] if jitter else 0)
+        doc = _rl_doc() if miss and k % miss == 0 else _rl_doc(five=int(20 + 30 * t / 3600), fr=fr)
+        soma_ctx.write_from_statusline(doc, str(sd), N + t)
+        if t % 120 == 0:
+            prompts.append(_shows(sd, N + t + 1))
+    return prompts.index(True) if True in prompts else None
+
+
+def test_sim_jitter_and_a_missing_window_project_like_clean_data(tmp_path):
+    clean = _sim_first(tmp_path / "a")
+    assert clean is not None and clean <= 12
+    for name, kw in (("b", {"jitter": True}), ("c", {"miss": 10})):
+        got = _sim_first(tmp_path / name, **kw)
+        assert got is not None and abs(got - clean) <= 1, (kw, got, clean)
+
+
+def test_real_rollover_restarts_and_waits_for_evidence_again(tmp_path):
+    def w(t, p, fr):
+        soma_ctx.write_from_statusline(_rl_doc(five=p, fr=fr), str(tmp_path), N + t)
+    for i in range(6):
+        w(300 * i, 80 + 3 * i, N + 2100)  # 80..95 over 25 min, out before the reset
+    assert _shows(tmp_path, N + 1501)
+    w(2400, 2, N + 2100 + 5 * 3600)       # the window rolled over: resets_at +5 h, use down to 2
+    assert _ctxfile(tmp_path)["five_series"] == _series((N + 2400, 2))
+    seen = []
+    for i, p in enumerate((4, 6, 8), 1):
+        w(2400 + 300 * i, p, N + 2100 + 5 * 3600)
+        seen.append(_shows(tmp_path, N + 2401 + 300 * i))
+    assert seen == [False, False, True]   # 15 min and 6 points again before it shows
+
+
+def test_one_point_dip_keeps_the_series(tmp_path):
+    for t, p in ((0, 50), (300, 52), (600, 51), (900, 53)):
+        soma_ctx.write_from_statusline(_rl_doc(five=p, fr=N + 9000), str(tmp_path), N + t)
+    assert _ctxfile(tmp_path)["five_series"] == _series((N, 50), (N + 300, 52), (N + 900, 53))
+    soma_ctx.write_from_statusline(_rl_doc(five=51, fr=N + 9000), str(tmp_path), N + 1200)  # 2 points down
+    assert _ctxfile(tmp_path)["five_series"] == _series((N + 1200, 51))
+
+
+def test_resets_at_drift_kept_and_an_earlier_jump_waits_for_agreement(tmp_path):
+    def w(t, p, fr):
+        soma_ctx.write_from_statusline(_rl_doc(five=p, fr=fr), str(tmp_path), N + t)
+    w(0, 50, N + 9000)
+    w(300, 53, N + 9300)                  # 300 s later: the same window
+    w(600, 56, N + 9000)                  # 300 s earlier: the same window
+    soma_ctx.write_from_statusline({"session_id": SID, "rate_limits": {}}, str(tmp_path), N + 700)  # no window
+    assert len(_ctxfile(tmp_path)["five_series"]) == 3
+    w(900, 59, N + 8000)                  # 1000 s earlier: doubtful, kept but not projected
+    assert len(_ctxfile(tmp_path)["five_series"]) == 4
+    assert not _shows(tmp_path, N + 901)
+    w(1200, 62, N + 8100)                 # the next refresh agrees with it
+    assert len(_ctxfile(tmp_path)["five_series"]) == 5
+    assert _shows(tmp_path, N + 1201)
+
+
+def test_prompts_twenty_minutes_apart_show_the_projection(tmp_path):
+    """12 points/hour from 60 %: each turn refreshes the statusline 30..120 s after its prompt,
+    then the user thinks for 20 minutes. The rate is the series', the idle gap is no point."""
+    reset, shown = N + 4 * 3600, []
+    for k in range(8):
+        t0 = N + 1200 * k
+        shown.append(_shows(tmp_path, t0))
+        for d in (30, 60, 90, 120):
+            t = t0 + d
+            soma_ctx.write_from_statusline(_rl_doc(five=int(60 + 12 * (t - N) / 3600), fr=reset), str(tmp_path), t)
+    first = shown.index(True)
+    assert first <= 4 and all(shown[first:]), shown
+    last = N + 1200 * 7 + 120
+    assert _shows(tmp_path, last + 28 * 60)    # the newest series point is the turn's first refresh
+    assert not _shows(tmp_path, last + 35 * 60)  # 35 minutes of silence: hidden
+
+
+def test_burst_needs_exactly_three_points(tmp_path):
+    # whole span 5 / 6000 s runs out after the reset; the recent third rises exactly 3 / 1800 s
+    r = _quota(tmp_path, pct=85, series=_series((N - 6000, 80), (N - 1800, 82), (N, 85)))
+    assert f"out ~{_hm(N + 9000)}" in r["seg"], r["seg"]
+    # recent third rises 2 / 1800 s (would run out at N + 9000); the whole span's 5 / 6000 s after the reset
+    r = _quota(tmp_path, pct=90, series=_series((N - 6000, 85), (N - 1800, 88), (N, 90)))
+    assert r["seg"].endswith("5h 90%"), r["seg"]
