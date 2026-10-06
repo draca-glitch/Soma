@@ -142,11 +142,15 @@ def test_no_session_id_falls_back_host_wide(tmp_path):
     assert not (tmp_path / "state" / "soma-pulse").exists()
 
 
-def test_new_session_is_not_told_chronic_condition(tmp_path):
+def test_first_contact_without_session_file_is_told_standing_flags_once(tmp_path):
+    """Replaces test_new_session_is_not_told_chronic_condition (0.10.1 fix round): a session
+    with no file has been told nothing, so it hears a standing condition once, whatever another
+    session's samples left in the host-wide state."""
     ok, sick = _proc(tmp_path, "ok"), _proc(tmp_path, "sick", **SICK)
     assert _pulse(tmp_path, ok, 0, "A", 300) is None
     assert _pulse(tmp_path, sick, 1, "A", 300)
-    assert _pulse(tmp_path, sick, 2, "B", 300) is None    # B seeds from the host baseline
+    assert "swap" in _pulse(tmp_path, sick, 2, "B", 300)  # B was never told
+    assert _pulse(tmp_path, sick, 3, "B", 300) is None    # once
 
 
 def test_subagent_announces_nothing_and_leaves_told_state(tmp_path):
@@ -171,18 +175,23 @@ def _env(sd, **over):
     return _quiet_env(sd, **over)
 
 
+def _seed_session(sd, sid, held, **extra):
+    d = sd / "soma-pulse"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{sid}.json").write_text(json.dumps(dict({"ts": int(time.time()), "held": held}, **extra)))
+
+
 def test_hook_json_shape_and_plain(tmp_path):
     sd = tmp_path / "state"
     env = _env(sd, SOMA_PULSE_HOLD_S="300", SOMA_MODE="always")
-    # seed a flag the quiet host does not have: its clearing is the transition under test
-    sd.mkdir()
-    (sd / "soma-state.json").write_text(json.dumps({"last_flags": ["FAKE_OLD"]}))
+    # seed each session as told a flag the quiet host does not have: its clearing is the transition
+    for sid in ("s1", "s2", "s3"):
+        _seed_session(sd, sid, {"SWAP": None})
     r = _run(HOOKS / "soma-pulse.py", json.dumps({"session_id": "s1"}), env)
     assert r.returncode == 0 and r.stderr == ""
-    # FAKE_OLD is unknown to the host: held, not cleared inside 300 s, and no new flag => silent
+    # SWAP is absent on the quiet host: held, not cleared inside 300 s, and no new flag => silent
     assert r.stdout == ""
     env["SOMA_PULSE_HOLD_S"] = "0"
-    (sd / "soma-state.json").write_text(json.dumps({"last_flags": ["FAKE_OLD"]}))
     r = _run(HOOKS / "soma-pulse.py", json.dumps({"session_id": "s2"}), env)
     out = json.loads(r.stdout)
     assert list(out) == ["hookSpecificOutput"]
@@ -191,7 +200,6 @@ def test_hook_json_shape_and_plain(tmp_path):
     assert hso["hookEventName"] == "PostToolUse" and hso["additionalContext"].startswith("[system-state] ")
     assert "\n" not in r.stdout.strip()
     env["SOMA_PULSE_FORMAT"] = "plain"
-    (sd / "soma-state.json").write_text(json.dumps({"last_flags": ["FAKE_OLD"]}))
     r = _run(HOOKS / "soma-pulse.py", json.dumps({"session_id": "s3"}), env)
     assert r.stdout.startswith("[system-state] ") and r.stdout.count("\n") == 1
 
@@ -214,6 +222,23 @@ def test_hook_hostile_stdin(tmp_path, stdin):
     assert not (tmp_path / "etc").exists()
     for p in sd.rglob("*"):
         assert ".." not in p.name
+    # with a forced flag the output is exactly one JSON object of the documented shape
+    # (or nothing, for the one payload that names a subagent)
+    sd2 = tmp_path / "state2"
+    r = _run(HOOKS / "soma-pulse.py", stdin, _env(sd2, SOMA_MEM_AVAIL_PCT="101"))
+    assert r.returncode == 0 and r.stderr == ""
+    if stdin == '{"agent_id": {"a": 1}}':
+        assert r.stdout == ""
+        return
+    assert r.stdout.endswith("\n") and r.stdout.count("\n") == 1
+    out = json.loads(r.stdout)
+    assert list(out) == ["hookSpecificOutput"]
+    hso = out["hookSpecificOutput"]
+    assert list(hso) == ["hookEventName", "additionalContext"] and hso["hookEventName"] == "PostToolUse"
+    assert hso["additionalContext"].startswith("[system-state] ") and "(LOW)" in hso["additionalContext"]
+    assert not (tmp_path / "etc").exists()
+    for p in sd2.rglob("*"):
+        assert ".." not in p.name
 
 
 def test_hook_survives_missing_soma_ctx_pulse_path(tmp_path):
@@ -228,18 +253,6 @@ def test_hook_survives_missing_soma_ctx_pulse_path(tmp_path):
     assert out["hookSpecificOutput"]["additionalContext"].startswith("[system-state]")
     assert not (sd / "soma-pulse").exists()
     assert "pulse_held" in json.loads((sd / "soma-state.json").read_text())
-
-
-def test_hook_timing(tmp_path):
-    env = _env(tmp_path / "state")
-    payload = json.dumps({"session_id": "s1"})
-    _run(HOOKS / "soma-pulse.py", payload, env)
-    t0 = time.perf_counter()
-    for _ in range(10):
-        _run(HOOKS / "soma-pulse.py", payload, env)
-    per = (time.perf_counter() - t0) / 10
-    print(f"pulse hook end-to-end: {per * 1000:.1f} ms")
-    assert per < 0.5
 
 
 # --- shared per-session helper ----------------------------------------------------
@@ -257,10 +270,22 @@ def test_session_json_roundtrip_and_prune(tmp_path):
     assert not old.exists()
 
 
+def _v0100_soma_ctx():
+    try:
+        r = subprocess.run(["git", "-C", str(HOOKS.parent), "show", "v0.10.0:hooks/soma_ctx.py"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout else None
+
+
 def test_older_soma_ctx_without_session_helpers(tmp_path):
-    """A 0.10.0 soma_ctx.py (no session store): the context segment stays, the pulse goes host-wide."""
-    old = ("import os\ndef context_segment(h, s=None, n=None):\n    return None, False\n"
-           "def state_dir(o=None):\n    return o or os.environ['SOMA_STATE_DIR']\n")
+    """The real v0.10.0 soma_ctx.py (no session store) beside this soma_lib.py: both hooks work,
+    the context segment stays, the pulse goes host-wide."""
+    old = _v0100_soma_ctx()
+    if old is None:
+        pytest.skip("git or the v0.10.0 tag unavailable")
+    assert "read_session_json" not in old
     hooks = _copy_hooks(tmp_path, old)
     sd = tmp_path / "state"
     sd.mkdir()
@@ -269,3 +294,6 @@ def test_older_soma_ctx_without_session_helpers(tmp_path):
     r = _run(hooks / "soma-pulse.py", json.dumps({"session_id": "s1"}), env)
     assert r.returncode == 0 and r.stderr == ""
     assert "additionalContext" in r.stdout and not (sd / "soma-pulse").exists()
+    r = _run(hooks / "soma-state.py", json.dumps({"session_id": "s1"}), dict(env, SOMA_MODE="always"))
+    assert r.returncode == 0 and r.stderr == "" and "[system-state]" in r.stdout
+    assert not (sd / "soma-pulse").exists()

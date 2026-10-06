@@ -19,10 +19,12 @@ stdout (default json).
 
 Anti-flap: SOMA_PULSE_HOLD_S (default 300, 0 = off) is how long a chronic flag
 must stay absent, unbroken, before its recovery is announced; a flag is
-announced once while it is held. Acute flags (OOM, ECC) are announced on every
-appearance. Delivery is per session (<state_dir>/soma-pulse/<session_id>.json),
-so two sessions each hear a transition once. A tool call inside a subagent
-(stdin carries agent_id) announces nothing; the main agent hears it itself.
+announced once while it is held. Acute flags (OOM, ECC) are never held: every
+new kill or error is announced. Delivery is per session
+(<state_dir>/soma-pulse/<session_id>.json: told level flags plus the session's
+own OOM/ECC counter baseline), so two sessions each hear a transition or an
+event once. A tool call inside a subagent (stdin carries agent_id) announces
+nothing and leaves the session file alone; the main agent hears it itself.
 
 Usage in settings.json (PostToolUse, no matcher so every tool is sampled;
 the timeout is in SECONDS):

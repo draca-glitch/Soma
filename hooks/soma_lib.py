@@ -466,16 +466,26 @@ def load_state(state_dir: str | None = None) -> dict:
         return {}
 
 
-def save_state(doc: dict, state_dir: str | None = None) -> None:
-    """Persist the reading for the next run's deltas. Atomic replace, never raises."""
+def save_state(doc: dict, state_dir: str | None = None) -> bool:
+    """Persist the reading for the next run's deltas. Atomic replace through a pid-unique
+    temp file (parallel hooks must not tear one shared temp), never raises. True when written."""
+    tmp = None
     try:
         d = _state_dir(state_dir)
         d.mkdir(parents=True, exist_ok=True)
-        tmp = d / "soma-state.json.tmp"
+        tmp = d / f".soma-state.json.{os.getpid()}.tmp"
         tmp.write_text(json.dumps(doc))
-        tmp.replace(d / "soma-state.json")
+        os.replace(tmp, d / "soma-state.json")
+        tmp = None
+        return True
     except Exception:
-        return
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 # hwmon chip name -> sensor class. Only classes with a threshold are read;
@@ -778,24 +788,21 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
     if mode == "off":
         return None
     now = now if now is not None else time.time()
-    state = gather(proc_root, mounts, services, hwmon_root, sys_root)
-    prev = load_state(state_dir)
-    events = diff_events(state.get("counters", {}), prev.get("counters", {}))
-    trends = compute_trends(state, prev.get("anchor"), now)
+    state, prev, host_events, trends, doc = _sample(proc_root, mounts, services, hwmon_root, sys_root,
+                                                    state_dir, now)
+    counters = state.get("counters", {})
+    sid = _hook_sid(hook_input)
+    events = _session_events(counters, _read_session(PULSE_SUBDIR, sid, state_dir)) if sid else host_events
     a = assess(state, events=events, trends=trends)
-    doc = roll_state(prev, state, now)
     doc["last_flags"] = sorted(a["flags"])
-    _carry_pulse_held(prev, doc)
     ctx_seg, ctx_high = context_segment(hook_input, state_dir, now) if hook_input else (None, False)
     line = None
     if mode == "always" or a["flags"] or ctx_high:
         line = render(state, a)
         if ctx_seg:
             line += " · " + ctx_seg
-        # what this session has now been told, so the next pulse does not repeat it
-        held = _load_held(prev, _hook_sid(hook_input), state_dir)
-        held.update({f: None for f in a["flags"]})
-        _store_held(held, _hook_sid(hook_input), state_dir, now, doc)
+    # what this session has now been told, so the pulse neither repeats nor misses it
+    _record_prompt_told(doc, sid, a, line is not None, counters, state_dir, now)
     save_state(doc, state_dir)
     if line:
         log_emission(line, a["flags"] | ({"CTX"} if ctx_high else set()), state_dir)
@@ -805,6 +812,17 @@ def line_for_mode(mode: str, proc_root: str = "/proc", mounts=None, services=Non
 # Acute pain flags: their clearing is the delta baseline advancing, not a
 # recovery. Everything else clearing is a condition genuinely passing.
 ACUTE_FLAGS = {"OOM", "ECC"}
+
+# Every flag assess() can raise; anything else in a stored told-state is junk.
+KNOWN_FLAGS = {"DISK", "DRAIN", "ECC", "FILL", "GROW", "HOT", "LOAD", "LOW_MEM", "NUMB", "OOM",
+               "RAID", "SELF", "STEAL", "STRAIN", "SVC", "SWAP", "TOP"}
+
+# The kernel's cumulative damage counters behind the acute flags.
+ACUTE_COUNTERS = ("oom_kill", "edac_ce", "edac_ue")
+
+# A told-state timestamp this far ahead of the clock is accepted (clock skew between
+# hooks); anything later is junk.
+HELD_FUTURE_SLACK_S = 300
 
 
 def should_pulse(prev_flags: set, cur_flags: set) -> bool:
@@ -821,22 +839,23 @@ def pulse_hold_s() -> int:
 
 
 def pulse_transition(held: dict, cur_flags: set, now: float, hold_s: float) -> tuple:
-    """Pure hysteresis gate. held maps each flag the session has been told about and not yet
-    told cleared to None (present at the last sample) or the time it first went absent.
+    """Pure hysteresis gate. held maps each chronic flag the session has been told about and
+    not yet told cleared to None (present at the last sample) or the time it first went absent.
     Returns (appeared, recovered, new_held).
 
-    A flag not in held is announced once on appearing. A chronic flag counts as cleared only
-    after it stayed absent for hold_s without a break (a reappearance resets the clock and is
-    no new transition); then, and only then, its recovery is announced. Acute flags
-    (ACUTE_FLAGS) are announced on every appearance, their clearing is never announced and
-    carries no hold. hold_s <= 0 reproduces should_pulse."""
-    appeared = set(cur_flags) - set(held)
+    A chronic flag not in held is announced once on appearing. It counts as cleared only after
+    it stayed absent for hold_s without a break (a reappearance resets the clock and is no new
+    transition); then, and only then, its recovery is announced. An acute flag (ACUTE_FLAGS) in
+    cur_flags is fresh by construction (a counter delta against the caller's baseline), so it is
+    always in appeared; acute flags never enter new_held and an acute key in held is ignored.
+    hold_s <= 0 reproduces should_pulse."""
+    cur = set(cur_flags)
+    chronic = cur - ACUTE_FLAGS
+    appeared = (chronic - set(held)) | (cur & ACUTE_FLAGS)
     recovered = set()
-    new_held = {}
-    for f in cur_flags:
-        new_held[f] = None
+    new_held = {f: None for f in chronic}
     for f, absent_since in held.items():
-        if f in cur_flags or f in ACUTE_FLAGS:
+        if f in cur or f in ACUTE_FLAGS:
             continue
         since = absent_since if isinstance(absent_since, (int, float)) and absent_since <= now else now
         if now - since >= hold_s:
@@ -850,37 +869,53 @@ def _hook_sid(hook_input) -> str | None:
     return _safe_id(hook_input.get("session_id")) if isinstance(hook_input, dict) else None
 
 
-def _clean_held(raw) -> dict | None:
+def _finite(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and v not in (float("inf"), float("-inf"))
+
+
+def _clean_held(raw, now: float | None = None) -> dict | None:
+    """A stored told-state, junk dropped: keys that are not chronic flag names, values that
+    are not None or a finite number no later than now + HELD_FUTURE_SLACK_S. At most 64 entries."""
     if not isinstance(raw, dict):
         return None
-    return {k: (v if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
-            for k, v in list(raw.items())[:64] if isinstance(k, str)}
+    limit = (time.time() if now is None else now) + HELD_FUTURE_SLACK_S
+    out = {}
+    for k, v in list(raw.items())[:64]:
+        if not isinstance(k, str) or k not in KNOWN_FLAGS or k in ACUTE_FLAGS:
+            continue
+        if v is None or (_finite(v) and v <= limit):
+            out[k] = v
+    return out
 
 
-def _load_held(prev: dict, sid: str | None, state_dir: str | None) -> dict:
-    """What this session has been told: its own file, else (no session id, or a session seen
-    for the first time) the host-wide record, else the last sampled flag set as a baseline,
-    so a new session is not handed a chronic condition as news."""
-    if sid:
-        doc = _read_session(PULSE_SUBDIR, sid, state_dir)
-        held = _clean_held(doc.get("held")) if doc else None
-        if held is not None:
-            return held
-    else:
-        held = _clean_held(prev.get("pulse_held"))
-        if held is not None:
-            return held
+def _clean_counters(raw) -> dict:
+    """A stored acute-counter baseline: only the known counters with a non-negative integer value."""
+    if not isinstance(raw, dict):
+        return {}
+    return {k: raw[k] for k in ACUTE_COUNTERS
+            if isinstance(raw.get(k), int) and not isinstance(raw.get(k), bool) and raw[k] >= 0}
+
+
+def _acute_baseline(counters: dict) -> dict:
+    return {k: counters[k] for k in ACUTE_COUNTERS if isinstance(counters.get(k), int)}
+
+
+def _session_events(counters: dict, sdoc: dict | None) -> dict:
+    """Events as this session sees them: the acute counters diffed against the session's own
+    baseline (a session with no baseline yet hears no past events; a counter that went
+    backwards yields nothing), plus the live degraded levels."""
+    base = _clean_counters(sdoc.get("counters")) if isinstance(sdoc, dict) else {}
+    return diff_events(counters, base)
+
+
+def _seed_held(prev: dict) -> dict:
+    """Host-wide told-state for callers without a session id: the stored record, else the
+    last sampled chronic flags as a baseline. Acute flags never seed."""
+    held = _clean_held(prev.get("pulse_held"))
+    if held is not None:
+        return held
     flags = prev.get("last_flags")
-    return {f: None for f in flags if isinstance(f, str)} if isinstance(flags, list) else {}
-
-
-def _store_held(held: dict, sid: str | None, state_dir: str | None, now: float, doc: dict) -> None:
-    """Persist the told-state per session; with no session id (or no soma_ctx) in the
-    host-wide state doc, the pre-0.10.1 behaviour."""
-    if sid and _write_session(PULSE_SUBDIR, sid, {"ts": int(now), "held": held}, state_dir, now):
-        doc.pop("pulse_held", None)
-    else:
-        doc["pulse_held"] = held
+    return {f: None for f in flags if isinstance(f, str) and f not in ACUTE_FLAGS} if isinstance(flags, list) else {}
 
 
 def _carry_pulse_held(prev: dict, doc: dict) -> None:
@@ -888,11 +923,21 @@ def _carry_pulse_held(prev: dict, doc: dict) -> None:
         doc["pulse_held"] = prev["pulse_held"]
 
 
+def _sample(proc_root, mounts, services, hwmon_root, sys_root, state_dir, now):
+    state = gather(proc_root, mounts, services, hwmon_root, sys_root)
+    prev = load_state(state_dir)
+    host_events = diff_events(state.get("counters", {}), prev.get("counters", {}))
+    trends = compute_trends(state, prev.get("anchor"), now)
+    doc = roll_state(prev, state, now)
+    _carry_pulse_held(prev, doc)
+    return state, prev, host_events, trends, doc
+
+
 def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
                hwmon_root: str = "/sys/class/hwmon", sys_root: str = "/sys",
                state_dir: str | None = None, now: float | None = None,
                hook_input: dict | None = None, hold_s: float | None = None) -> str | None:
-    """Mid-turn proprioception for PostToolUse: emit only on flag transitions.
+    """Mid-turn proprioception for PostToolUse: emit only on transitions.
 
     The prompt-time hook re-orients at every prompt; at tool cadence that
     would be spam. This emits only when the body's condition changes while
@@ -900,37 +945,63 @@ def pulse_line(proc_root: str = "/proc", mounts=None, services=None,
     condition passed (after a hold, so a value hovering on a threshold does
     not flap). A long healthy turn costs zero lines.
 
-    Delivery is per session: what each session has been told lives in
-    <state_dir>/soma-pulse/<session_id>.json, so one session cannot consume a
-    transition another has yet to hear. A tool call made inside a subagent
-    (hook_input carries agent_id) samples and persists the baselines but
-    announces nothing and leaves the told-state alone: the main agent hears
-    the transition on its own next call.
+    Delivery is per session, in <state_dir>/soma-pulse/<session_id>.json:
+    the chronic flags this session has been told (with the hold), and its own
+    baseline of the kernel's cumulative OOM/ECC counters, so an acute event is
+    heard by every session independently. Only the session's own main-agent
+    samples (this and the prompt hook) touch that file: a tool call inside a
+    subagent (hook_input carries agent_id) announces nothing and leaves it
+    alone, so the main agent hears the event on its next call. A first contact
+    with no session file is told the standing flags once and baselines the
+    counters without announcing past events. Without a session id (or with an
+    older soma_ctx.py) the told-state and counters are host-wide. Nothing is
+    announced unless the told-state it implies was written.
     """
     if os.environ.get("SOMA_PULSE", "transition") == "off":
         return None
     now = now if now is not None else time.time()
     hold_s = pulse_hold_s() if hold_s is None else hold_s
-    state = gather(proc_root, mounts, services, hwmon_root, sys_root)
-    prev = load_state(state_dir)
-    events = diff_events(state.get("counters", {}), prev.get("counters", {}))
-    trends = compute_trends(state, prev.get("anchor"), now)
+    state, prev, host_events, trends, doc = _sample(proc_root, mounts, services, hwmon_root, sys_root,
+                                                    state_dir, now)
+    counters = state.get("counters", {})
+    sid = _hook_sid(hook_input)
+    subagent = isinstance(hook_input, dict) and bool(hook_input.get("agent_id"))
+    sdoc = _read_session(PULSE_SUBDIR, sid, state_dir) if sid and not subagent else None
+    events = _session_events(counters, sdoc) if sid and not subagent else host_events
     a = assess(state, events=events, trends=trends)
-    doc = roll_state(prev, state, now)
     doc["last_flags"] = sorted(a["flags"])
-    _carry_pulse_held(prev, doc)
-    if isinstance(hook_input, dict) and hook_input.get("agent_id"):
+    if subagent:
         save_state(doc, state_dir)
         return None
-    sid = _hook_sid(hook_input)
-    appeared, recovered, new_held = pulse_transition(_load_held(prev, sid, state_dir), a["flags"], now, hold_s)
-    _store_held(new_held, sid, state_dir, now, doc)
-    save_state(doc, state_dir)
-    if appeared or recovered:
+    if sid:
+        held = _clean_held(sdoc.get("held"), now) if isinstance(sdoc, dict) else None
+        appeared, recovered, new_held = pulse_transition(held or {}, a["flags"], now, hold_s)
+        told = _write_session(PULSE_SUBDIR, sid, {"ts": int(now), "held": new_held,
+                                                  "counters": _acute_baseline(counters)}, state_dir, now)
+        save_state(doc, state_dir)
+    else:
+        appeared, recovered, new_held = pulse_transition(_seed_held(prev), a["flags"], now, hold_s)
+        doc["pulse_held"] = new_held
+        told = save_state(doc, state_dir)
+    if (appeared or recovered) and told:
         line = render(state, a)
         log_emission(line, a["flags"], state_dir, src="pulse")
         return line
     return None
+
+
+def _record_prompt_told(doc: dict, sid: str | None, a: dict, emitted: bool,
+                        counters: dict, state_dir: str | None, now: float) -> None:
+    """The prompt hook's told-state: exactly the chronic flags on the line it printed (none when
+    it stayed silent; a flag that cleared is thereby told-cleared), plus the session's acute
+    baseline. With a session id it goes to the session file, written on every prompt; without
+    one, the host-wide record is updated only when a line was printed (the pre-0.10.1 rule)."""
+    told = {f: None for f in a["flags"] if f not in ACUTE_FLAGS} if emitted else {}
+    if sid:
+        _write_session(PULSE_SUBDIR, sid, {"ts": int(now), "held": told,
+                                           "counters": _acute_baseline(counters)}, state_dir, now)
+    elif emitted:
+        doc["pulse_held"] = told
 
 
 def log_emission(line: str, flags: set, state_dir: str | None = None, src: str = "state") -> None:
